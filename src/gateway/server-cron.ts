@@ -1,3 +1,7 @@
+import {
+  createConfiguredFeishuTaskBoardAdapter,
+  resolveFeishuTaskBoardConfig,
+} from "../../extensions/feishu/src/bitable.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
 import type { CliDeps } from "../cli/deps.js";
@@ -35,6 +39,14 @@ import { enqueueSystemEvent } from "../infra/system-events.js";
 import { getChildLogger } from "../logging.js";
 import { normalizeAgentId, toAgentStoreSessionKey } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
+import { reconcileTaskBoard } from "../tasks/board/reconcile.js";
+import { createTaskBoardSyncBoard, setTaskBoardSyncBoard } from "../tasks/board/sync.js";
+import {
+  createJarvisTaskNotifier,
+  runJarvisPeriodicSummary,
+  setJarvisTaskNotifier,
+} from "../tasks/notify/jarvis-status.js";
+import { TaskStore } from "../tasks/store.js";
 
 export type GatewayCronState = {
   cron: CronService;
@@ -43,6 +55,10 @@ export type GatewayCronState = {
 };
 
 const CRON_WEBHOOK_TIMEOUT_MS = 10_000;
+const TASK_BOARD_RECONCILE_JOB_NAME = "openclaw.tasks.board.reconcile";
+const TASK_BOARD_SUMMARY_JOB_NAME = "openclaw.tasks.jarvis.summary";
+const TASK_BOARD_RECONCILE_TEXT = "__openclaw.tasks.board.reconcile__";
+const TASK_BOARD_SUMMARY_TEXT = "__openclaw.tasks.jarvis.summary__";
 
 function trimToOptionalString(value: unknown): string | undefined {
   if (typeof value !== "string") {
@@ -233,6 +249,20 @@ export function buildGatewayCronService(params: {
     });
   const sessionStorePath = resolveSessionStorePath(defaultAgentId);
   const warnedLegacyWebhookJobs = new Set<string>();
+  const taskBoardConfig = resolveFeishuTaskBoardConfig(params.cfg);
+  const taskBoardAdapter = createConfiguredFeishuTaskBoardAdapter(params.cfg);
+  setTaskBoardSyncBoard(taskBoardAdapter ? createTaskBoardSyncBoard(taskBoardAdapter) : null);
+  if (taskBoardConfig?.summarySessionKey) {
+    setJarvisTaskNotifier(
+      createJarvisTaskNotifier({
+        send: async (text) => {
+          enqueueSystemEvent(text, { sessionKey: taskBoardConfig.summarySessionKey });
+        },
+      }),
+    );
+  } else {
+    setJarvisTaskNotifier(null);
+  }
 
   const cron = new CronService({
     storePath,
@@ -242,6 +272,25 @@ export function buildGatewayCronService(params: {
     resolveSessionStorePath,
     sessionStorePath,
     enqueueSystemEvent: (text, opts) => {
+      if (text === TASK_BOARD_RECONCILE_TEXT && taskBoardAdapter) {
+        void reconcileTaskBoard({
+          store: new TaskStore(),
+          board: {
+            upsertTask: async (task) => {
+              await createTaskBoardSyncBoard(taskBoardAdapter).upsertTask(task);
+            },
+            listRecords: async () => (await taskBoardAdapter.listRecords()).records,
+            updateRecord: async (recordId, fields) =>
+              await taskBoardAdapter.updateRecord(recordId, fields),
+          },
+          mode: "incremental",
+        });
+        return;
+      }
+      if (text === TASK_BOARD_SUMMARY_TEXT && taskBoardConfig?.summarySessionKey) {
+        void runJarvisPeriodicSummary(new TaskStore());
+        return;
+      }
       const { agentId, cfg: runtimeConfig } = resolveCronAgent(opts?.agentId);
       const sessionKey = resolveCronSessionKey({
         runtimeConfig,
@@ -536,6 +585,33 @@ export function buildGatewayCronService(params: {
       }
     },
   });
+
+  if (taskBoardAdapter) {
+    void (async () => {
+      const jobs = await cron.list({ includeDisabled: true });
+      const names = new Set(jobs.map((job) => job.name));
+      if (!names.has(TASK_BOARD_RECONCILE_JOB_NAME)) {
+        await cron.add({
+          name: TASK_BOARD_RECONCILE_JOB_NAME,
+          enabled: true,
+          schedule: { kind: "every", everyMs: 5 * 60 * 1000 },
+          sessionTarget: "main",
+          wakeMode: "next-heartbeat",
+          payload: { kind: "systemEvent", text: TASK_BOARD_RECONCILE_TEXT },
+        });
+      }
+      if (taskBoardConfig?.summarySessionKey && !names.has(TASK_BOARD_SUMMARY_JOB_NAME)) {
+        await cron.add({
+          name: TASK_BOARD_SUMMARY_JOB_NAME,
+          enabled: true,
+          schedule: { kind: "every", everyMs: 2 * 60 * 60 * 1000 },
+          sessionTarget: "main",
+          wakeMode: "next-heartbeat",
+          payload: { kind: "systemEvent", text: TASK_BOARD_SUMMARY_TEXT },
+        });
+      }
+    })();
+  }
 
   return { cron, storePath, cronEnabled };
 }

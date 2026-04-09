@@ -215,4 +215,49 @@ describe("buildGatewayCronService", () => {
       state.cron.stop();
     }
   });
+
+  it("registers repo-native task reconcile and summary jobs when feishu task board is enabled", async () => {
+    const tmpDir = path.join(os.tmpdir(), `server-cron-task-board-${Date.now()}`);
+    const cfg = {
+      session: {
+        mainKey: "main",
+      },
+      cron: {
+        store: path.join(tmpDir, "cron.json"),
+      },
+      channels: {
+        feishu: {
+          enabled: true,
+          appId: "cli_main",
+          appSecret: "secret_main",
+          taskBoard: {
+            enabled: true,
+            appToken: "app_token",
+            tableId: "tbl_task_board",
+            summarySessionKey: "agent:agent_jarvis:feishu:group:oc_ops",
+          },
+        },
+      },
+    } as OpenClawConfig;
+    loadConfigMock.mockReturnValue(cfg);
+
+    const state = buildGatewayCronService({
+      cfg,
+      deps: {} as CliDeps,
+      broadcast: () => {},
+    });
+    try {
+      let jobs = await state.cron.list({ includeDisabled: true });
+      for (let i = 0; i < 20 && jobs.length < 2; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        jobs = await state.cron.list({ includeDisabled: true });
+      }
+      const names = jobs.map((job) => job.name);
+
+      expect(names).toContain("openclaw.tasks.board.reconcile");
+      expect(names).toContain("openclaw.tasks.jarvis.summary");
+    } finally {
+      state.cron.stop();
+    }
+  });
 });
