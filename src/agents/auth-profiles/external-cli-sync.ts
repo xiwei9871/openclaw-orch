@@ -1,30 +1,19 @@
 import {
   readCodexCliCredentialsCached,
+  readQwenCliCredentialsCached,
   readMiniMaxCliCredentialsCached,
 } from "../cli-credentials.js";
 import {
+  CODEX_CLI_PROFILE_ID,
+  EXTERNAL_CLI_NEAR_EXPIRY_MS,
   EXTERNAL_CLI_SYNC_TTL_MS,
-  OPENAI_CODEX_DEFAULT_PROFILE_ID,
+  QWEN_CLI_PROFILE_ID,
   MINIMAX_CLI_PROFILE_ID,
   log,
 } from "./constants.js";
-import type { AuthProfileStore, ExternalOAuthManager, OAuthCredential } from "./types.js";
+import type { AuthProfileCredential, AuthProfileStore, OAuthCredential } from "./types.js";
 
-type ExternalCliSyncOptions = {
-  log?: boolean;
-};
-
-type ExternalCliSyncProvider = {
-  profileId: string;
-  provider: string;
-  managedBy: ExternalOAuthManager;
-  readCredentials: () => OAuthCredential | null;
-};
-
-export function areOAuthCredentialsEquivalent(
-  a: OAuthCredential | undefined,
-  b: OAuthCredential,
-): boolean {
+function shallowEqualOAuthCredentials(a: OAuthCredential | undefined, b: OAuthCredential): boolean {
   if (!a) {
     return false;
   }
@@ -39,157 +28,125 @@ export function areOAuthCredentialsEquivalent(
     a.email === b.email &&
     a.enterpriseUrl === b.enterpriseUrl &&
     a.projectId === b.projectId &&
-    a.accountId === b.accountId &&
-    a.managedBy === b.managedBy
+    a.accountId === b.accountId
   );
 }
 
-function hasNewerStoredOAuthCredential(
-  existing: OAuthCredential | undefined,
-  incoming: OAuthCredential,
-): boolean {
-  return Boolean(
-    existing &&
-    existing.provider === incoming.provider &&
-    Number.isFinite(existing.expires) &&
-    (!Number.isFinite(incoming.expires) || existing.expires > incoming.expires),
-  );
-}
-
-export function shouldReplaceStoredOAuthCredential(
-  existing: OAuthCredential | undefined,
-  incoming: OAuthCredential,
-): boolean {
-  if (!existing || existing.type !== "oauth") {
-    return true;
-  }
-  if (areOAuthCredentialsEquivalent(existing, incoming)) {
+function isExternalProfileFresh(cred: AuthProfileCredential | undefined, now: number): boolean {
+  if (!cred) {
     return false;
   }
-  return !hasNewerStoredOAuthCredential(existing, incoming);
-}
-
-const EXTERNAL_CLI_SYNC_PROVIDERS: ExternalCliSyncProvider[] = [
-  {
-    profileId: MINIMAX_CLI_PROFILE_ID,
-    provider: "minimax-portal",
-    managedBy: "minimax-cli",
-    readCredentials: () => readMiniMaxCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS }),
-  },
-  {
-    profileId: OPENAI_CODEX_DEFAULT_PROFILE_ID,
-    provider: "openai-codex",
-    managedBy: "codex-cli",
-    readCredentials: () => readCodexCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS }),
-  },
-];
-
-function withExternalCliManager(
-  creds: OAuthCredential,
-  managedBy: ExternalOAuthManager,
-): OAuthCredential {
-  return {
-    ...creds,
-    managedBy,
-  };
-}
-
-function resolveExternalCliSyncProvider(params: {
-  profileId?: string;
-  credential?: OAuthCredential;
-}): ExternalCliSyncProvider | null {
-  const byProfileId =
-    typeof params.profileId === "string"
-      ? EXTERNAL_CLI_SYNC_PROVIDERS.find((entry) => entry.profileId === params.profileId)
-      : undefined;
-  if (byProfileId) {
-    return byProfileId;
+  if (cred.type !== "oauth" && cred.type !== "token") {
+    return false;
   }
-  const managedBy = params.credential?.managedBy;
-  if (!managedBy) {
-    return null;
+  if (
+    cred.provider !== "openai-codex" &&
+    cred.provider !== "qwen-portal" &&
+    cred.provider !== "minimax-portal"
+  ) {
+    return false;
   }
-  return (
-    EXTERNAL_CLI_SYNC_PROVIDERS.find(
-      (entry) =>
-        entry.managedBy === managedBy &&
-        (!params.credential || entry.provider === params.credential.provider),
-    ) ?? null
-  );
-}
-
-export function readManagedExternalCliCredential(params: {
-  profileId?: string;
-  credential: OAuthCredential;
-}): OAuthCredential | null {
-  const provider = resolveExternalCliSyncProvider(params);
-  if (!provider) {
-    return null;
+  if (typeof cred.expires !== "number") {
+    return true;
   }
-  const creds = provider.readCredentials();
-  if (!creds) {
-    return null;
-  }
-  return withExternalCliManager(creds, provider.managedBy);
+  return cred.expires > now + EXTERNAL_CLI_NEAR_EXPIRY_MS;
 }
 
 /** Sync external CLI credentials into the store for a given provider. */
 function syncExternalCliCredentialsForProvider(
   store: AuthProfileStore,
-  providerConfig: ExternalCliSyncProvider,
-  options: ExternalCliSyncOptions,
+  profileId: string,
+  provider: string,
+  readCredentials: () => OAuthCredential | null,
+  now: number,
 ): boolean {
-  const { profileId, provider, managedBy, readCredentials } = providerConfig;
   const existing = store.profiles[profileId];
-  const creds = readCredentials();
+  const shouldSync =
+    !existing || existing.provider !== provider || !isExternalProfileFresh(existing, now);
+  const creds = shouldSync ? readCredentials() : null;
   if (!creds) {
     return false;
   }
-  const managedCreds = withExternalCliManager(creds, managedBy);
 
   const existingOAuth = existing?.type === "oauth" ? existing : undefined;
-  if (!shouldReplaceStoredOAuthCredential(existingOAuth, managedCreds)) {
-    if (options.log !== false) {
-      if (!areOAuthCredentialsEquivalent(existingOAuth, managedCreds) && existingOAuth) {
-        log.debug(`kept newer stored ${provider} credentials over external cli sync`, {
-          profileId,
-          storedExpires: new Date(existingOAuth.expires).toISOString(),
-          externalExpires: Number.isFinite(managedCreds.expires)
-            ? new Date(managedCreds.expires).toISOString()
-            : null,
-        });
-      }
-    }
-    return false;
-  }
+  const shouldUpdate =
+    !existingOAuth ||
+    existingOAuth.provider !== provider ||
+    existingOAuth.expires <= now ||
+    creds.expires > existingOAuth.expires;
 
-  store.profiles[profileId] = managedCreds;
-  if (options.log !== false) {
+  if (shouldUpdate && !shallowEqualOAuthCredentials(existingOAuth, creds)) {
+    store.profiles[profileId] = creds;
     log.info(`synced ${provider} credentials from external cli`, {
       profileId,
-      expires: new Date(managedCreds.expires).toISOString(),
-      managedBy,
+      expires: new Date(creds.expires).toISOString(),
     });
+    return true;
   }
-  return true;
+
+  return false;
 }
 
 /**
- * Sync OAuth credentials from external CLI tools (MiniMax CLI, Codex CLI)
- * into the store.
+ * Sync OAuth credentials from external CLI tools (Qwen Code CLI, MiniMax CLI) into the store.
  *
  * Returns true if any credentials were updated.
  */
-export function syncExternalCliCredentials(
-  store: AuthProfileStore,
-  options: ExternalCliSyncOptions = {},
-): boolean {
+export function syncExternalCliCredentials(store: AuthProfileStore): boolean {
   let mutated = false;
+  const now = Date.now();
 
-  for (const provider of EXTERNAL_CLI_SYNC_PROVIDERS) {
-    if (syncExternalCliCredentialsForProvider(store, provider, options)) {
+  if (
+    syncExternalCliCredentialsForProvider(
+      store,
+      CODEX_CLI_PROFILE_ID,
+      "openai-codex",
+      () => readCodexCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS }),
+      now,
+    )
+  ) {
+    mutated = true;
+  }
+
+  // Sync from Qwen Code CLI
+  const existingQwen = store.profiles[QWEN_CLI_PROFILE_ID];
+  const shouldSyncQwen =
+    !existingQwen ||
+    existingQwen.provider !== "qwen-portal" ||
+    !isExternalProfileFresh(existingQwen, now);
+  const qwenCreds = shouldSyncQwen
+    ? readQwenCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS })
+    : null;
+  if (qwenCreds) {
+    const existing = store.profiles[QWEN_CLI_PROFILE_ID];
+    const existingOAuth = existing?.type === "oauth" ? existing : undefined;
+    const shouldUpdate =
+      !existingOAuth ||
+      existingOAuth.provider !== "qwen-portal" ||
+      existingOAuth.expires <= now ||
+      qwenCreds.expires > existingOAuth.expires;
+
+    if (shouldUpdate && !shallowEqualOAuthCredentials(existingOAuth, qwenCreds)) {
+      store.profiles[QWEN_CLI_PROFILE_ID] = qwenCreds;
       mutated = true;
+      log.info("synced qwen credentials from qwen cli", {
+        profileId: QWEN_CLI_PROFILE_ID,
+        expires: new Date(qwenCreds.expires).toISOString(),
+      });
     }
+  }
+
+  // Sync from MiniMax Portal CLI
+  if (
+    syncExternalCliCredentialsForProvider(
+      store,
+      MINIMAX_CLI_PROFILE_ID,
+      "minimax-portal",
+      () => readMiniMaxCliCredentialsCached({ ttlMs: EXTERNAL_CLI_SYNC_TTL_MS }),
+      now,
+    )
+  ) {
+    mutated = true;
   }
 
   return mutated;

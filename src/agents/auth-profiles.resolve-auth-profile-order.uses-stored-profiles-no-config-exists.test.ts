@@ -4,6 +4,7 @@ import {
   ANTHROPIC_CFG,
   ANTHROPIC_STORE,
 } from "./auth-profiles.resolve-auth-profile-order.fixtures.js";
+import { CODEX_CLI_PROFILE_ID } from "./auth-profiles/constants.js";
 
 describe("resolveAuthProfileOrder", () => {
   const store = ANTHROPIC_STORE;
@@ -106,6 +107,38 @@ describe("resolveAuthProfileOrder", () => {
       provider: "openai-codex",
     });
     expect(order).toEqual(["openai-codex:user@example.com"]);
+  });
+
+  it("prefers synced codex-cli profile over stored explicit openai-codex order", () => {
+    const order = resolveAuthProfileOrder({
+      store: {
+        version: 1,
+        profiles: {
+          "openai-codex:user@example.com": {
+            type: "oauth",
+            provider: "openai-codex",
+            access: "email-access-token",
+            refresh: "email-refresh-token",
+            expires: Date.now() + 60_000,
+            email: "user@example.com",
+          },
+          [CODEX_CLI_PROFILE_ID]: {
+            type: "oauth",
+            provider: "openai-codex",
+            access: "codex-access-token",
+            refresh: "codex-refresh-token",
+            expires: Date.now() + 60_000,
+            accountId: "acct-codex",
+          },
+        },
+        order: {
+          "openai-codex": ["openai-codex:user@example.com"],
+        },
+      },
+      provider: "openai-codex",
+    });
+
+    expect(order).toEqual([CODEX_CLI_PROFILE_ID, "openai-codex:user@example.com"]);
   });
   it("does not bypass explicit ids when the configured profile exists but is invalid", () => {
     const order = resolveAuthProfileOrder({

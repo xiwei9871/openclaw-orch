@@ -4,6 +4,7 @@ import {
   normalizeProviderId,
   normalizeProviderIdForAuth,
 } from "../model-selection.js";
+import { CODEX_CLI_PROFILE_ID } from "./constants.js";
 import {
   evaluateStoredCredentialEligibility,
   type AuthCredentialReasonCode,
@@ -113,7 +114,26 @@ export function resolveAuthProfileOrder(params: {
     filtered = storeProfiles.filter(isValidProfile);
   }
 
-  const deduped = dedupeProfileIds(filtered);
+  let deduped = dedupeProfileIds(filtered);
+
+  if (
+    providerAuthKey === "openai-codex" &&
+    store.profiles[CODEX_CLI_PROFILE_ID] &&
+    !deduped.includes(CODEX_CLI_PROFILE_ID) &&
+    isValidProfile(CODEX_CLI_PROFILE_ID)
+  ) {
+    deduped = [...deduped, CODEX_CLI_PROFILE_ID];
+  }
+
+  const preferCodexCliProfile = (order: string[]): string[] => {
+    if (providerAuthKey !== "openai-codex" || !order.includes(CODEX_CLI_PROFILE_ID)) {
+      return order;
+    }
+    return [
+      CODEX_CLI_PROFILE_ID,
+      ...order.filter((profileId) => profileId !== CODEX_CLI_PROFILE_ID),
+    ];
+  };
 
   // If user specified explicit order (store override or config), respect it
   // exactly, but still apply cooldown sorting to avoid repeatedly selecting
@@ -138,7 +158,7 @@ export function resolveAuthProfileOrder(params: {
       .toSorted((a, b) => a.cooldownUntil - b.cooldownUntil)
       .map((entry) => entry.profileId);
 
-    const ordered = [...available, ...cooldownSorted];
+    const ordered = preferCodexCliProfile([...available, ...cooldownSorted]);
 
     // Still put preferredProfile first if specified
     if (preferredProfile && ordered.includes(preferredProfile)) {
@@ -150,7 +170,7 @@ export function resolveAuthProfileOrder(params: {
   // Otherwise, use round-robin: sort by lastUsed (oldest first)
   // preferredProfile goes first if specified (for explicit user choice)
   // lastGood is NOT prioritized - that would defeat round-robin
-  const sorted = orderProfilesByMode(deduped, store);
+  const sorted = preferCodexCliProfile(orderProfilesByMode(deduped, store));
 
   if (preferredProfile && sorted.includes(preferredProfile)) {
     return [preferredProfile, ...sorted.filter((e) => e !== preferredProfile)];
