@@ -176,6 +176,18 @@ const FeishuSharedConfigShape = {
   resolveSenderNames: z.boolean().optional(),
 };
 
+const FeishuTaskBoardSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    accountId: z.string().optional(),
+    appToken: z.string().optional(),
+    tableId: z.string().optional(),
+    summarySessionKey: z.string().optional(),
+    summaryChatId: z.string().optional(),
+  })
+  .strict()
+  .optional();
+
 /**
  * Per-account configuration.
  * All fields are optional - missing fields inherit from top-level config.
@@ -221,6 +233,7 @@ export const FeishuConfigSchema = z
     // Optimization flags
     typingIndicator: z.boolean().optional().default(true),
     resolveSenderNames: z.boolean().optional().default(true),
+    taskBoard: FeishuTaskBoardSchema,
     // Multi-account configuration
     accounts: z.record(z.string(), FeishuAccountConfigSchema.optional()).optional(),
   })

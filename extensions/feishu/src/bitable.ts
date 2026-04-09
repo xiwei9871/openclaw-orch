@@ -1,7 +1,11 @@
 import type * as Lark from "@larksuiteoapi/node-sdk";
 import { Type } from "@sinclair/typebox";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/feishu";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/feishu";
 import { listEnabledFeishuAccounts } from "./accounts.js";
+import { resolveFeishuAccount } from "./accounts.js";
+import { createFeishuBitableClient, ensureLarkSuccess } from "./bitable-client.js";
+import { createFeishuClient } from "./client.js";
 import { createFeishuToolClient } from "./tool-account.js";
 
 // ============ Helpers ============
@@ -11,31 +15,6 @@ function json(data: unknown) {
     content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
     details: data,
   };
-}
-
-type LarkResponse<T = unknown> = { code?: number; msg?: string; data?: T };
-
-export class LarkApiError extends Error {
-  readonly code: number;
-  readonly api: string;
-  readonly context?: Record<string, unknown>;
-  constructor(code: number, message: string, api: string, context?: Record<string, unknown>) {
-    super(`[${api}] code=${code} message=${message}`);
-    this.name = "LarkApiError";
-    this.code = code;
-    this.api = api;
-    this.context = context;
-  }
-}
-
-function ensureLarkSuccess<T>(
-  res: LarkResponse<T>,
-  api: string,
-  context?: Record<string, unknown>,
-): asserts res is LarkResponse<T> & { code: 0 } {
-  if (res.code !== 0) {
-    throw new LarkApiError(res.code ?? -1, res.msg ?? "unknown error", api, context);
-  }
 }
 
 /** Field type ID to human-readable name */
@@ -180,21 +159,8 @@ async function listRecords(
   pageSize?: number,
   pageToken?: string,
 ) {
-  const res = await client.bitable.appTableRecord.list({
-    path: { app_token: appToken, table_id: tableId },
-    params: {
-      page_size: pageSize ?? 100,
-      ...(pageToken && { page_token: pageToken }),
-    },
-  });
-  ensureLarkSuccess(res, "bitable.appTableRecord.list", { appToken, tableId, pageSize });
-
-  return {
-    records: res.data?.items ?? [],
-    has_more: res.data?.has_more ?? false,
-    page_token: res.data?.page_token,
-    total: res.data?.total,
-  };
+  const adapter = createFeishuBitableClient(client, appToken, tableId);
+  return adapter.listRecords(pageSize, pageToken);
 }
 
 async function getRecord(client: Lark.Client, appToken: string, tableId: string, recordId: string) {
@@ -214,16 +180,8 @@ async function createRecord(
   tableId: string,
   fields: Record<string, unknown>,
 ) {
-  const res = await client.bitable.appTableRecord.create({
-    path: { app_token: appToken, table_id: tableId },
-    // oxlint-disable-next-line typescript/no-explicit-any
-    data: { fields: fields as any },
-  });
-  ensureLarkSuccess(res, "bitable.appTableRecord.create", { appToken, tableId });
-
-  return {
-    record: res.data?.record,
-  };
+  const adapter = createFeishuBitableClient(client, appToken, tableId);
+  return adapter.createRecord(fields);
 }
 
 /** Logger interface for cleanup operations */
@@ -426,16 +384,8 @@ async function updateRecord(
   recordId: string,
   fields: Record<string, unknown>,
 ) {
-  const res = await client.bitable.appTableRecord.update({
-    path: { app_token: appToken, table_id: tableId, record_id: recordId },
-    // oxlint-disable-next-line typescript/no-explicit-any
-    data: { fields: fields as any },
-  });
-  ensureLarkSuccess(res, "bitable.appTableRecord.update", { appToken, tableId, recordId });
-
-  return {
-    record: res.data?.record,
-  };
+  const adapter = createFeishuBitableClient(client, appToken, tableId);
+  return adapter.updateRecord(recordId, fields);
 }
 
 // ============ Schemas ============
@@ -722,4 +672,50 @@ export function registerFeishuBitableTools(api: OpenClawPluginApi) {
   });
 
   api.logger.info?.("feishu_bitable: Registered bitable tools");
+}
+
+export type FeishuTaskBoardConfig = {
+  accountId?: string;
+  appToken: string;
+  tableId: string;
+  summarySessionKey?: string;
+  summaryChatId?: string;
+};
+
+export function resolveFeishuTaskBoardConfig(cfg: OpenClawConfig): FeishuTaskBoardConfig | null {
+  const taskBoard = (cfg.channels?.feishu as { taskBoard?: Record<string, unknown> } | undefined)
+    ?.taskBoard;
+  if (!taskBoard || taskBoard.enabled === false) {
+    return null;
+  }
+  const appToken = typeof taskBoard.appToken === "string" ? taskBoard.appToken.trim() : "";
+  const tableId = typeof taskBoard.tableId === "string" ? taskBoard.tableId.trim() : "";
+  if (!appToken || !tableId) {
+    return null;
+  }
+  const accountId =
+    typeof taskBoard.accountId === "string" ? taskBoard.accountId.trim() : undefined;
+  const summarySessionKey =
+    typeof taskBoard.summarySessionKey === "string"
+      ? taskBoard.summarySessionKey.trim()
+      : undefined;
+  const summaryChatId =
+    typeof taskBoard.summaryChatId === "string" ? taskBoard.summaryChatId.trim() : undefined;
+  return {
+    accountId,
+    appToken,
+    tableId,
+    summarySessionKey,
+    summaryChatId,
+  };
+}
+
+export function createConfiguredFeishuTaskBoardAdapter(cfg: OpenClawConfig) {
+  const taskBoard = resolveFeishuTaskBoardConfig(cfg);
+  if (!taskBoard) {
+    return null;
+  }
+  const account = resolveFeishuAccount({ cfg, accountId: taskBoard.accountId });
+  const client = createFeishuClient(account);
+  return createFeishuBitableClient(client, taskBoard.appToken, taskBoard.tableId);
 }
