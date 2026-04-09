@@ -1,8 +1,11 @@
 import type * as Lark from "@larksuiteoapi/node-sdk";
 import { Type } from "@sinclair/typebox";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import type { OpenClawPluginApi } from "../runtime-api.js";
+import type { OpenClawConfig, OpenClawPluginApi } from "../runtime-api.js";
 import { listEnabledFeishuAccounts } from "./accounts.js";
+import { resolveFeishuAccount } from "./accounts.js";
+import { createFeishuBitableClient, ensureLarkSuccess } from "./bitable-client.js";
+import { createFeishuClient } from "./client.js";
 import { createFeishuToolClient } from "./tool-account.js";
 
 // ============ Helpers ============
@@ -14,41 +17,8 @@ function json(data: unknown) {
   };
 }
 
-type LarkResponse<T = unknown> = { code?: number; msg?: string; data?: T };
-type BitableRecordCreatePayload = NonNullable<
-  Parameters<Lark.Client["bitable"]["appTableRecord"]["create"]>[0]
->;
-type BitableRecordUpdatePayload = NonNullable<
-  Parameters<Lark.Client["bitable"]["appTableRecord"]["update"]>[0]
->;
-type BitableRecordFields = NonNullable<NonNullable<BitableRecordCreatePayload["data"]>["fields"]>;
-type BitableRecordUpdateFields = NonNullable<
-  NonNullable<BitableRecordUpdatePayload["data"]>["fields"]
->;
-
-export class LarkApiError extends Error {
-  readonly code: number;
-  readonly api: string;
-  readonly context?: Record<string, unknown>;
-  constructor(code: number, message: string, api: string, context?: Record<string, unknown>) {
-    super(`[${api}] code=${code} message=${message}`);
-    this.name = "LarkApiError";
-    this.code = code;
-    this.api = api;
-    this.context = context;
-  }
-}
-
-function ensureLarkSuccess<T>(
-  res: LarkResponse<T>,
-  api: string,
-  context?: Record<string, unknown>,
-): asserts res is LarkResponse<T> & { code: 0 } {
-  if (res.code !== 0) {
-    throw new LarkApiError(res.code ?? -1, res.msg ?? "unknown error", api, context);
-  }
-}
-
+type BitableRecordFields = Record<string, unknown>;
+type BitableRecordUpdateFields = Record<string, unknown>;
 /** Field type ID to human-readable name */
 const FIELD_TYPE_NAMES: Record<number, string> = {
   1: "Text",
@@ -191,21 +161,8 @@ async function listRecords(
   pageSize?: number,
   pageToken?: string,
 ) {
-  const res = await client.bitable.appTableRecord.list({
-    path: { app_token: appToken, table_id: tableId },
-    params: {
-      page_size: pageSize ?? 100,
-      ...(pageToken && { page_token: pageToken }),
-    },
-  });
-  ensureLarkSuccess(res, "bitable.appTableRecord.list", { appToken, tableId, pageSize });
-
-  return {
-    records: res.data?.items ?? [],
-    has_more: res.data?.has_more ?? false,
-    page_token: res.data?.page_token,
-    total: res.data?.total,
-  };
+  const adapter = createFeishuBitableClient(client, appToken, tableId);
+  return adapter.listRecords(pageSize, pageToken);
 }
 
 async function getRecord(client: Lark.Client, appToken: string, tableId: string, recordId: string) {
@@ -225,15 +182,8 @@ async function createRecord(
   tableId: string,
   fields: BitableRecordFields,
 ) {
-  const res = await client.bitable.appTableRecord.create({
-    path: { app_token: appToken, table_id: tableId },
-    data: { fields },
-  });
-  ensureLarkSuccess(res, "bitable.appTableRecord.create", { appToken, tableId });
-
-  return {
-    record: res.data?.record,
-  };
+  const adapter = createFeishuBitableClient(client, appToken, tableId);
+  return adapter.createRecord(fields);
 }
 
 /** Logger interface for cleanup operations */
@@ -434,17 +384,10 @@ async function updateRecord(
   appToken: string,
   tableId: string,
   recordId: string,
-  fields: NonNullable<NonNullable<BitableRecordUpdatePayload["data"]>["fields"]>,
+  fields: BitableRecordUpdateFields,
 ) {
-  const res = await client.bitable.appTableRecord.update({
-    path: { app_token: appToken, table_id: tableId, record_id: recordId },
-    data: { fields },
-  });
-  ensureLarkSuccess(res, "bitable.appTableRecord.update", { appToken, tableId, recordId });
-
-  return {
-    record: res.data?.record,
-  };
+  const adapter = createFeishuBitableClient(client, appToken, tableId);
+  return adapter.updateRecord(recordId, fields);
 }
 
 // ============ Schemas ============
@@ -731,4 +674,50 @@ export function registerFeishuBitableTools(api: OpenClawPluginApi) {
   });
 
   api.logger.info?.("feishu_bitable: Registered bitable tools");
+}
+
+export type FeishuTaskBoardConfig = {
+  accountId?: string;
+  appToken: string;
+  tableId: string;
+  summarySessionKey?: string;
+  summaryChatId?: string;
+};
+
+export function resolveFeishuTaskBoardConfig(cfg: OpenClawConfig): FeishuTaskBoardConfig | null {
+  const taskBoard = (cfg.channels?.feishu as { taskBoard?: Record<string, unknown> } | undefined)
+    ?.taskBoard;
+  if (!taskBoard || taskBoard.enabled === false) {
+    return null;
+  }
+  const appToken = typeof taskBoard.appToken === "string" ? taskBoard.appToken.trim() : "";
+  const tableId = typeof taskBoard.tableId === "string" ? taskBoard.tableId.trim() : "";
+  if (!appToken || !tableId) {
+    return null;
+  }
+  const accountId =
+    typeof taskBoard.accountId === "string" ? taskBoard.accountId.trim() : undefined;
+  const summarySessionKey =
+    typeof taskBoard.summarySessionKey === "string"
+      ? taskBoard.summarySessionKey.trim()
+      : undefined;
+  const summaryChatId =
+    typeof taskBoard.summaryChatId === "string" ? taskBoard.summaryChatId.trim() : undefined;
+  return {
+    accountId,
+    appToken,
+    tableId,
+    summarySessionKey,
+    summaryChatId,
+  };
+}
+
+export function createConfiguredFeishuTaskBoardAdapter(cfg: OpenClawConfig) {
+  const taskBoard = resolveFeishuTaskBoardConfig(cfg);
+  if (!taskBoard) {
+    return null;
+  }
+  const account = resolveFeishuAccount({ cfg, accountId: taskBoard.accountId });
+  const client = createFeishuClient(account);
+  return createFeishuBitableClient(client, taskBoard.appToken, taskBoard.tableId);
 }
