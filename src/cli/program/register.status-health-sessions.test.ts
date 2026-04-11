@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   tasksListCommand: vi.fn(),
   tasksAuditCommand: vi.fn(),
   tasksMaintenanceCommand: vi.fn(),
+  tasksControlCommand: vi.fn(),
   tasksShowCommand: vi.fn(),
   tasksNotifyCommand: vi.fn(),
   tasksCancelCommand: vi.fn(),
@@ -31,6 +32,7 @@ const sessionsCleanupCommand = mocks.sessionsCleanupCommand;
 const tasksListCommand = mocks.tasksListCommand;
 const tasksAuditCommand = mocks.tasksAuditCommand;
 const tasksMaintenanceCommand = mocks.tasksMaintenanceCommand;
+const tasksControlCommand = mocks.tasksControlCommand;
 const tasksShowCommand = mocks.tasksShowCommand;
 const tasksNotifyCommand = mocks.tasksNotifyCommand;
 const tasksCancelCommand = mocks.tasksCancelCommand;
@@ -60,6 +62,7 @@ vi.mock("../../commands/tasks.js", () => ({
   tasksListCommand: mocks.tasksListCommand,
   tasksAuditCommand: mocks.tasksAuditCommand,
   tasksMaintenanceCommand: mocks.tasksMaintenanceCommand,
+  tasksControlCommand: mocks.tasksControlCommand,
   tasksShowCommand: mocks.tasksShowCommand,
   tasksNotifyCommand: mocks.tasksNotifyCommand,
   tasksCancelCommand: mocks.tasksCancelCommand,
@@ -96,6 +99,7 @@ describe("registerStatusHealthSessionsCommands", () => {
     tasksListCommand.mockResolvedValue(undefined);
     tasksAuditCommand.mockResolvedValue(undefined);
     tasksMaintenanceCommand.mockResolvedValue(undefined);
+    tasksControlCommand.mockResolvedValue(undefined);
     tasksShowCommand.mockResolvedValue(undefined);
     tasksNotifyCommand.mockResolvedValue(undefined);
     tasksCancelCommand.mockResolvedValue(undefined);
@@ -281,6 +285,66 @@ describe("registerStatusHealthSessionsCommands", () => {
       expect.objectContaining({
         json: true,
         apply: true,
+      }),
+      runtime,
+    );
+  });
+
+  it("runs tasks control subcommand with timezone forwarding", async () => {
+    await runCli(["tasks", "--json", "control", "--time-zone", "Asia/Shanghai"]);
+
+    expect(tasksControlCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        json: true,
+        timeZone: "Asia/Shanghai",
+      }),
+      runtime,
+    );
+  });
+
+  it("runs tasks control subcommand with Feishu sync forwarding", async () => {
+    await runCli([
+      "tasks",
+      "control",
+      "--sync-feishu",
+      "--account",
+      "jarvis",
+      "--app-token",
+      "app_token_x",
+      "--table-id",
+      "tbl_x",
+    ]);
+
+    expect(tasksControlCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        syncFeishu: true,
+        feishuAccount: "jarvis",
+        appToken: "app_token_x",
+        tableId: "tbl_x",
+      }),
+      runtime,
+    );
+  });
+
+  it("runs tasks control subcommand with summary delivery forwarding", async () => {
+    await runCli([
+      "tasks",
+      "control",
+      "--write-summary",
+      "/tmp/task-health.md",
+      "--send-feishu-summary",
+      "--summary-target",
+      "chat:oc_group_1",
+      "--summary-account",
+      "jarvis",
+    ]);
+
+    expect(tasksControlCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        writeSummary: "/tmp/task-health.md",
+        sendFeishuSummary: true,
+        summaryTarget: "chat:oc_group_1",
+        summaryAccount: "jarvis",
       }),
       runtime,
     );

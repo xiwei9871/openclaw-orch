@@ -1,6 +1,13 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { loadConfig } from "../config/config.js";
 import { info } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
+import {
+  buildTaskControlPlane,
+  buildTaskControlProjectionLayer,
+  renderJarvisTaskHealthSummaryMarkdown,
+} from "../tasks/control-plane/index.js";
 import {
   cancelTaskById,
   getTaskById,
@@ -546,4 +553,151 @@ export async function tasksMaintenanceCommand(
   if (!opts.apply) {
     runtime.log("Dry run only. Re-run with `openclaw tasks maintenance --apply` to write changes.");
   }
+}
+
+export async function tasksControlCommand(
+  opts: {
+    json?: boolean;
+    timeZone?: string;
+    syncFeishu?: boolean;
+    feishuAccount?: string;
+    appToken?: string;
+    tableId?: string;
+    writeSummary?: string;
+    sendFeishuSummary?: boolean;
+    summaryTarget?: string;
+    summaryAccount?: string;
+  },
+  runtime: RuntimeEnv,
+) {
+  const model = buildTaskControlPlane();
+  const projectionLayer = buildTaskControlProjectionLayer(model, {
+    now: model.generatedAt,
+    timeZone: opts.timeZone,
+  });
+  let summaryFilePath: string | undefined;
+  let summaryDelivery:
+    | {
+        channel: "feishu";
+        accountId: string;
+        target: string;
+      }
+    | undefined;
+  let projectionSync:
+    | Awaited<
+        ReturnType<
+          typeof import("../tasks/control-plane/feishu-bitable.js").syncTaskControlProjectionToFeishu
+        >
+      >
+    | undefined;
+
+  if (opts.syncFeishu) {
+    if (!opts.appToken?.trim() || !opts.tableId?.trim()) {
+      runtime.error("--sync-feishu requires --app-token and --table-id");
+      runtime.exit(1);
+      return;
+    }
+    const { syncTaskControlProjectionToFeishu } =
+      await import("../tasks/control-plane/feishu-bitable.js");
+    projectionSync = await syncTaskControlProjectionToFeishu({
+      cfg: loadConfig(),
+      projection: projectionLayer.feishu,
+      target: {
+        appToken: opts.appToken.trim(),
+        tableId: opts.tableId.trim(),
+        accountId: opts.feishuAccount?.trim(),
+      },
+    });
+  }
+
+  if (opts.writeSummary?.trim()) {
+    const outputPath = path.resolve(opts.writeSummary.trim());
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(
+      outputPath,
+      renderJarvisTaskHealthSummaryMarkdown(projectionLayer.summary),
+      "utf8",
+    );
+    summaryFilePath = outputPath;
+  }
+
+  if (opts.sendFeishuSummary) {
+    if (!opts.summaryTarget?.trim()) {
+      runtime.error("--send-feishu-summary requires --summary-target");
+      runtime.exit(1);
+      return;
+    }
+    const { sendMessageFeishu } = await import("../../extensions/feishu/src/send.js");
+    const cfg = loadConfig();
+    const accountId = opts.summaryAccount?.trim() || opts.feishuAccount?.trim() || "jarvis";
+    await sendMessageFeishu({
+      cfg,
+      to: opts.summaryTarget.trim(),
+      text: projectionLayer.summary.text,
+      accountId,
+    });
+    summaryDelivery = {
+      channel: "feishu",
+      accountId,
+      target: opts.summaryTarget.trim(),
+    };
+  }
+
+  if (opts.json) {
+    runtime.log(
+      JSON.stringify(
+        {
+          generatedAt: model.generatedAt,
+          source: model.source,
+          taskCatalog: model.taskCatalog,
+          taskSnapshot: model.taskSnapshot,
+          taskLedger: model.taskLedger,
+          healthModel: model.healthModel,
+          errorClassification: model.errorClassification,
+          projectionLayer,
+          ...(summaryFilePath ? { summaryFilePath } : {}),
+          ...(summaryDelivery ? { summaryDelivery } : {}),
+          ...(projectionSync ? { projectionSync } : {}),
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  runtime.log(info("Task Control Plane"));
+  runtime.log(
+    info(
+      `Catalog: ${model.taskCatalog.total} tasks · Snapshot: ${model.taskSnapshot.active} active / ${model.taskSnapshot.failures} failures`,
+    ),
+  );
+  runtime.log(
+    info(
+      `Health: ${model.healthModel.overallSeverity} · critical ${model.healthModel.summary.critical} · warn ${model.healthModel.summary.warn}`,
+    ),
+  );
+  runtime.log(
+    info(
+      `Errors: ${model.errorClassification.problematic} problematic · views ${projectionLayer.feishu.views.map((view) => view.name).join(", ")}`,
+    ),
+  );
+  if (projectionSync) {
+    runtime.log(
+      info(
+        `Feishu sync: ${projectionSync.rowsCreated} created · ${projectionSync.rowsUpdated} updated · ${projectionSync.viewsCreated} views created · ${projectionSync.viewsUpdated} views patched`,
+      ),
+    );
+  }
+  if (summaryFilePath) {
+    runtime.log(info(`Summary file: ${summaryFilePath}`));
+  }
+  if (summaryDelivery) {
+    runtime.log(
+      info(
+        `Summary delivered: ${summaryDelivery.channel}:${summaryDelivery.accountId} -> ${summaryDelivery.target}`,
+      ),
+    );
+  }
+  runtime.log("Re-run with `openclaw tasks control --json` for the full control-plane payload.");
 }

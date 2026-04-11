@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { requireNodeSqlite } from "../memory/sqlite.js";
+import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { TaskStore } from "./store.js";
 
 describe("TaskStore", () => {
