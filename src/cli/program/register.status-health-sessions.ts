@@ -395,6 +395,8 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .option("--send-feishu-summary", "Send Jarvis task health summary to Feishu", false)
     .option("--summary-target <target>", "Feishu send target such as chat:oc_xxx")
     .option("--summary-account <id>", "Feishu account id used for summary delivery")
+    .option("--inventory", "Include workspace/cron/path/provider inventory", false)
+    .option("--write-inventory <dir>", "Write inventory JSON files into a directory")
     .action(async (opts, command) => {
       const parentOpts = command.parent?.opts() as { json?: boolean } | undefined;
       await runCommandWithRuntime(defaultRuntime, async () => {
@@ -410,6 +412,8 @@ export function registerStatusHealthSessionsCommands(program: Command) {
             sendFeishuSummary: Boolean(opts.sendFeishuSummary),
             summaryTarget: opts.summaryTarget as string | undefined,
             summaryAccount: opts.summaryAccount as string | undefined,
+            inventory: Boolean(opts.inventory),
+            writeInventory: opts.writeInventory as string | undefined,
           },
           defaultRuntime,
         );

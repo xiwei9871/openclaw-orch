@@ -350,6 +350,18 @@ describe("registerStatusHealthSessionsCommands", () => {
     );
   });
 
+  it("runs tasks control subcommand with inventory forwarding", async () => {
+    await runCli(["tasks", "control", "--inventory", "--write-inventory", "/tmp/system_inventory"]);
+
+    expect(tasksControlCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        inventory: true,
+        writeInventory: "/tmp/system_inventory",
+      }),
+      runtime,
+    );
+  });
+
   it("runs tasks audit subcommand with filters", async () => {
     await runCli([
       "tasks",

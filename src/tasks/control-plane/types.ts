@@ -222,3 +222,109 @@ export type TaskControlProjectionLayer = {
   feishu: FeishuTaskControlProjection;
   summary: JarvisTaskHealthSummary;
 };
+
+export type WorkspaceInventoryEntry = {
+  path: string;
+  normalizedPath: string;
+  exists: boolean;
+  isPrimary: boolean;
+  primaryMarker: boolean;
+  configuredDefault: boolean;
+  configuredAgents: string[];
+  referencedByCronIds: string[];
+};
+
+export type WorkspaceInventory = {
+  generatedAt: number;
+  primaryWorkspace?: string;
+  total: number;
+  entries: WorkspaceInventoryEntry[];
+};
+
+export type CronInventoryEntry = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  agentId?: string;
+  sessionKey?: string;
+  sessionTarget?: string;
+  wakeMode?: string;
+  scheduleKind: string;
+  payloadKind?: string;
+  model?: string;
+  fallbacks: string[];
+  nextRunAtMs?: number;
+  lastRunAtMs?: number;
+  lastStatus?: string;
+  consecutiveErrors: number;
+  lastError?: string;
+  pathReferences: string[];
+};
+
+export type CronInventory = {
+  generatedAt: number;
+  total: number;
+  enabled: number;
+  disabled: number;
+  entries: CronInventoryEntry[];
+};
+
+export type PathInventoryCategory =
+  | "legacy_home_node"
+  | "openclaw_home"
+  | "workspace"
+  | "report"
+  | "script"
+  | "other";
+
+export type PathInventoryEntry = {
+  rawPath: string;
+  normalizedPath: string;
+  source: "config" | "cron";
+  owner: string;
+  field: string;
+  category: PathInventoryCategory;
+  exists: boolean | null;
+};
+
+export type PathInventory = {
+  generatedAt: number;
+  total: number;
+  entries: PathInventoryEntry[];
+  byCategory: Record<PathInventoryCategory, number>;
+};
+
+export type ProviderInventoryEntry = {
+  provider: string;
+  configured: boolean;
+  referencedByDefault: boolean;
+  referencedByAgents: number;
+  referencedByCron: number;
+};
+
+export type ProviderInventory = {
+  generatedAt: number;
+  configuredProviders: string[];
+  defaultPrimary?: string;
+  defaultFallbacks: string[];
+  agentModels: Array<{
+    agentId: string;
+    primary?: string;
+    fallbacks: string[];
+  }>;
+  cronModels: Array<{
+    cronId: string;
+    name: string;
+    model?: string;
+    fallbacks: string[];
+  }>;
+  entries: ProviderInventoryEntry[];
+};
+
+export type TaskControlInventory = {
+  generatedAt: number;
+  workspaceInventory: WorkspaceInventory;
+  cronInventory: CronInventory;
+  pathInventory: PathInventory;
+  providerInventory: ProviderInventory;
+};

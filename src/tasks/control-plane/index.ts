@@ -17,4 +17,5 @@ export {
   createFeishuTaskControlClient,
   syncTaskControlProjectionToFeishu,
 } from "./feishu-bitable.js";
+export { buildTaskControlInventory, writeTaskControlInventory } from "./inventory.js";
 export type * from "./types.js";

@@ -292,4 +292,44 @@ describe("tasks commands", () => {
       });
     });
   });
+
+  it("emits inventory JSON and writes inventory files when requested", async () => {
+    await withTaskCommandStateDir(async () => {
+      await withTempDir({ prefix: "openclaw-task-inventory-" }, async (root) => {
+        const inventoryDir = path.join(root, "inventory");
+        const runtime = createRuntime();
+
+        await tasksControlCommand(
+          {
+            json: true,
+            inventory: true,
+            writeInventory: inventoryDir,
+          },
+          runtime,
+        );
+
+        const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
+          inventory: {
+            workspaceInventory: { total: number };
+            cronInventory: { total: number };
+            pathInventory: { total: number };
+            providerInventory: { entries: unknown[] };
+          };
+          inventoryFiles: {
+            rootDir: string;
+            files: Record<string, string>;
+          };
+        };
+
+        expect(payload.inventory.workspaceInventory.total).toBeGreaterThanOrEqual(0);
+        expect(payload.inventory.cronInventory.total).toBeGreaterThanOrEqual(0);
+        expect(payload.inventory.pathInventory.total).toBeGreaterThanOrEqual(0);
+        expect(payload.inventory.providerInventory.entries).toBeDefined();
+        expect(payload.inventoryFiles.rootDir).toBe(inventoryDir);
+        await expect(
+          fs.readFile(payload.inventoryFiles.files.workspaces, "utf8"),
+        ).resolves.toContain('"entries":');
+      });
+    });
+  });
 });

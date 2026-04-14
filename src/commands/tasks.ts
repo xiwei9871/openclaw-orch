@@ -6,7 +6,9 @@ import type { RuntimeEnv } from "../runtime.js";
 import {
   buildTaskControlPlane,
   buildTaskControlProjectionLayer,
+  buildTaskControlInventory,
   renderJarvisTaskHealthSummaryMarkdown,
+  writeTaskControlInventory,
 } from "../tasks/control-plane/index.js";
 import {
   cancelTaskById,
@@ -567,6 +569,8 @@ export async function tasksControlCommand(
     sendFeishuSummary?: boolean;
     summaryTarget?: string;
     summaryAccount?: string;
+    inventory?: boolean;
+    writeInventory?: string;
   },
   runtime: RuntimeEnv,
 ) {
@@ -575,7 +579,10 @@ export async function tasksControlCommand(
     now: model.generatedAt,
     timeZone: opts.timeZone,
   });
+  const inventory =
+    opts.inventory || opts.writeInventory ? await buildTaskControlInventory() : undefined;
   let summaryFilePath: string | undefined;
+  let inventoryFiles: Awaited<ReturnType<typeof writeTaskControlInventory>> | undefined;
   let summaryDelivery:
     | {
         channel: "feishu";
@@ -621,6 +628,10 @@ export async function tasksControlCommand(
     summaryFilePath = outputPath;
   }
 
+  if (opts.writeInventory?.trim() && inventory) {
+    inventoryFiles = await writeTaskControlInventory(inventory, opts.writeInventory.trim());
+  }
+
   if (opts.sendFeishuSummary) {
     if (!opts.summaryTarget?.trim()) {
       runtime.error("--send-feishu-summary requires --summary-target");
@@ -655,6 +666,8 @@ export async function tasksControlCommand(
           healthModel: model.healthModel,
           errorClassification: model.errorClassification,
           projectionLayer,
+          ...(inventory ? { inventory } : {}),
+          ...(inventoryFiles ? { inventoryFiles } : {}),
           ...(summaryFilePath ? { summaryFilePath } : {}),
           ...(summaryDelivery ? { summaryDelivery } : {}),
           ...(projectionSync ? { projectionSync } : {}),
@@ -682,6 +695,16 @@ export async function tasksControlCommand(
       `Errors: ${model.errorClassification.problematic} problematic · views ${projectionLayer.feishu.views.map((view) => view.name).join(", ")}`,
     ),
   );
+  if (inventory) {
+    runtime.log(
+      info(
+        `Inventory: ${inventory.workspaceInventory.total} workspaces · ${inventory.cronInventory.total} cron jobs · ${inventory.pathInventory.total} path refs · ${inventory.providerInventory.entries.length} providers`,
+      ),
+    );
+  }
+  if (inventoryFiles) {
+    runtime.log(info(`Inventory dir: ${inventoryFiles.rootDir}`));
+  }
   if (projectionSync) {
     runtime.log(
       info(
