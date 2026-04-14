@@ -328,3 +328,23 @@ export type TaskControlInventory = {
   pathInventory: PathInventory;
   providerInventory: ProviderInventory;
 };
+
+export type CronPathRepairEntry = {
+  cronId: string;
+  name: string;
+  changed: boolean;
+  fields: Array<{
+    field: "payload.text" | "payload.message";
+    before: string;
+    after: string;
+  }>;
+};
+
+export type CronPathRepairReport = {
+  generatedAt: number;
+  changedJobs: number;
+  totalJobs: number;
+  entries: CronPathRepairEntry[];
+  applied: boolean;
+  storePath: string;
+};

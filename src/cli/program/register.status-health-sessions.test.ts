@@ -362,6 +362,18 @@ describe("registerStatusHealthSessionsCommands", () => {
     );
   });
 
+  it("runs tasks control subcommand with cron path repair forwarding", async () => {
+    await runCli(["tasks", "control", "--preview-cron-path-repair", "--apply-cron-path-repair"]);
+
+    expect(tasksControlCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        previewCronPathRepair: true,
+        applyCronPathRepair: true,
+      }),
+      runtime,
+    );
+  });
+
   it("runs tasks audit subcommand with filters", async () => {
     await runCli([
       "tasks",

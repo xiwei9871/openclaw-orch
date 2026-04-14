@@ -4,9 +4,11 @@ import { loadConfig } from "../config/config.js";
 import { info } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
 import {
+  applyCronPathRepair,
   buildTaskControlPlane,
   buildTaskControlProjectionLayer,
   buildTaskControlInventory,
+  buildCronPathRepairReport,
   renderJarvisTaskHealthSummaryMarkdown,
   writeTaskControlInventory,
 } from "../tasks/control-plane/index.js";
@@ -571,6 +573,8 @@ export async function tasksControlCommand(
     summaryAccount?: string;
     inventory?: boolean;
     writeInventory?: string;
+    previewCronPathRepair?: boolean;
+    applyCronPathRepair?: boolean;
   },
   runtime: RuntimeEnv,
 ) {
@@ -581,6 +585,12 @@ export async function tasksControlCommand(
   });
   const inventory =
     opts.inventory || opts.writeInventory ? await buildTaskControlInventory() : undefined;
+  const cronPathRepair =
+    opts.previewCronPathRepair || opts.applyCronPathRepair
+      ? opts.applyCronPathRepair
+        ? await applyCronPathRepair()
+        : await buildCronPathRepairReport()
+      : undefined;
   let summaryFilePath: string | undefined;
   let inventoryFiles: Awaited<ReturnType<typeof writeTaskControlInventory>> | undefined;
   let summaryDelivery:
@@ -667,6 +677,7 @@ export async function tasksControlCommand(
           errorClassification: model.errorClassification,
           projectionLayer,
           ...(inventory ? { inventory } : {}),
+          ...(cronPathRepair ? { cronPathRepair } : {}),
           ...(inventoryFiles ? { inventoryFiles } : {}),
           ...(summaryFilePath ? { summaryFilePath } : {}),
           ...(summaryDelivery ? { summaryDelivery } : {}),
@@ -704,6 +715,13 @@ export async function tasksControlCommand(
   }
   if (inventoryFiles) {
     runtime.log(info(`Inventory dir: ${inventoryFiles.rootDir}`));
+  }
+  if (cronPathRepair) {
+    runtime.log(
+      info(
+        `Cron path repair: ${cronPathRepair.changedJobs} changed / ${cronPathRepair.totalJobs} total (${cronPathRepair.applied ? "applied" : "preview"})`,
+      ),
+    );
   }
   if (projectionSync) {
     runtime.log(

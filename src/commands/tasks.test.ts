@@ -332,4 +332,29 @@ describe("tasks commands", () => {
       });
     });
   });
+
+  it("previews cron path repair through tasks control", async () => {
+    await withTaskCommandStateDir(async () => {
+      const runtime = createRuntime();
+
+      await tasksControlCommand(
+        {
+          json: true,
+          previewCronPathRepair: true,
+        },
+        runtime,
+      );
+
+      const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
+        cronPathRepair: {
+          applied: boolean;
+          changedJobs: number;
+          totalJobs: number;
+        };
+      };
+
+      expect(payload.cronPathRepair.applied).toBe(false);
+      expect(payload.cronPathRepair.totalJobs).toBeGreaterThanOrEqual(0);
+    });
+  });
 });

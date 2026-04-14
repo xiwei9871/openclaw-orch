@@ -18,4 +18,9 @@ export {
   syncTaskControlProjectionToFeishu,
 } from "./feishu-bitable.js";
 export { buildTaskControlInventory, writeTaskControlInventory } from "./inventory.js";
+export {
+  applyCronPathRepair,
+  buildCronPathRepairReport,
+  normalizeOpenClawPathReferences,
+} from "./path-governance.js";
 export type * from "./types.js";

@@ -397,6 +397,8 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .option("--summary-account <id>", "Feishu account id used for summary delivery")
     .option("--inventory", "Include workspace/cron/path/provider inventory", false)
     .option("--write-inventory <dir>", "Write inventory JSON files into a directory")
+    .option("--preview-cron-path-repair", "Preview cron payload path normalization", false)
+    .option("--apply-cron-path-repair", "Apply cron payload path normalization", false)
     .action(async (opts, command) => {
       const parentOpts = command.parent?.opts() as { json?: boolean } | undefined;
       await runCommandWithRuntime(defaultRuntime, async () => {
@@ -414,6 +416,8 @@ export function registerStatusHealthSessionsCommands(program: Command) {
             summaryAccount: opts.summaryAccount as string | undefined,
             inventory: Boolean(opts.inventory),
             writeInventory: opts.writeInventory as string | undefined,
+            previewCronPathRepair: Boolean(opts.previewCronPathRepair),
+            applyCronPathRepair: Boolean(opts.applyCronPathRepair),
           },
           defaultRuntime,
         );
