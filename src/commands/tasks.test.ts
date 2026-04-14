@@ -315,6 +315,13 @@ describe("tasks commands", () => {
             pathInventory: { total: number };
             providerInventory: { entries: unknown[] };
           };
+          inventoryStatus: {
+            workspace: string;
+            cron: string;
+            path: string;
+            provider: string;
+          };
+          warnings: string[];
           inventoryFiles: {
             rootDir: string;
             files: Record<string, string>;
@@ -325,11 +332,52 @@ describe("tasks commands", () => {
         expect(payload.inventory.cronInventory.total).toBeGreaterThanOrEqual(0);
         expect(payload.inventory.pathInventory.total).toBeGreaterThanOrEqual(0);
         expect(payload.inventory.providerInventory.entries).toBeDefined();
+        expect(payload.inventoryStatus.provider).toBeDefined();
+        expect(Array.isArray(payload.warnings)).toBe(true);
         expect(payload.inventoryFiles.rootDir).toBe(inventoryDir);
         await expect(
           fs.readFile(payload.inventoryFiles.files.workspaces, "utf8"),
         ).resolves.toContain('"entries":');
       });
+    });
+  });
+
+  it("keeps pure-read tasks control commands working when config is invalid", async () => {
+    await withTaskCommandStateDir(async () => {
+      await fs.writeFile(
+        path.join(process.env.OPENCLAW_STATE_DIR!, "openclaw.json"),
+        "{ invalid json",
+        "utf8",
+      );
+
+      const runtime = createRuntime();
+      await tasksControlCommand(
+        {
+          json: true,
+          inventory: true,
+          previewCronPathRepair: true,
+        },
+        runtime,
+      );
+
+      const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
+        inventory: {
+          cronInventory: { total: number };
+          providerInventory: { configReadable: boolean; providerInventoryDegraded: boolean };
+        };
+        inventoryStatus: { provider: string };
+        warnings: string[];
+        cronPathRepair: { applied: boolean; totalJobs: number };
+      };
+
+      expect(payload.inventory.cronInventory.total).toBeGreaterThanOrEqual(0);
+      expect(payload.inventory.providerInventory.configReadable).toBe(false);
+      expect(payload.inventory.providerInventory.providerInventoryDegraded).toBe(true);
+      expect(payload.inventoryStatus.provider).toBe("degraded");
+      expect(
+        payload.warnings.some((warning) => warning.includes("provider inventory degraded")),
+      ).toBe(true);
+      expect(payload.cronPathRepair.applied).toBe(false);
     });
   });
 

@@ -90,6 +90,7 @@ export const cliCommandCatalog: readonly CliCommandCatalogEntry[] = [
     policy: { ensureCliPath: false },
     route: { id: "models-status" },
   },
+  { commandPath: ["tasks", "control"], exact: true, policy: { bypassConfigGuard: true } },
   { commandPath: ["backup"], policy: { bypassConfigGuard: true } },
   { commandPath: ["doctor"], policy: { bypassConfigGuard: true } },
   {

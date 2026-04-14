@@ -1,15 +1,15 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  listAgentIds,
-  resolveAgentWorkspaceDir,
-  resolveDefaultAgentId,
-} from "../../agents/agent-scope.js";
-import { loadConfig } from "../../config/config.js";
+import { resolveDefaultAgentWorkspaceDir } from "../../agents/workspace.js";
 import type { OpenClawConfig } from "../../config/types.js";
 import { loadCronStore, resolveCronStorePath } from "../../cron/store.js";
 import type { CronJob, CronStoreFile } from "../../cron/types.js";
 import { resolveHomeRelativePath, resolveRequiredHomeDir } from "../../infra/home-dir.js";
+import {
+  buildTaskControlConfigLite,
+  readTaskControlConfigLite,
+  type TaskControlConfigLite,
+} from "./config-lite.js";
 import type {
   CronInventory,
   CronInventoryEntry,
@@ -19,6 +19,7 @@ import type {
   ProviderInventory,
   ProviderInventoryEntry,
   TaskControlInventory,
+  TaskControlInventoryStatus,
   WorkspaceInventory,
   WorkspaceInventoryEntry,
 } from "./types.js";
@@ -26,6 +27,7 @@ import type {
 type BuildTaskControlInventoryOptions = {
   now?: number;
   cfg?: OpenClawConfig;
+  configLite?: TaskControlConfigLite;
   cronStore?: CronStoreFile;
   stateDir?: string;
 };
@@ -55,24 +57,6 @@ function extractProviderId(modelRef: string | undefined): string | undefined {
   }
   const slashIndex = normalized.indexOf("/");
   return slashIndex > 0 ? normalized.slice(0, slashIndex) : normalized;
-}
-
-function resolveModelRouting(
-  model:
-    | string
-    | {
-        primary?: string;
-        fallbacks?: string[];
-      }
-    | undefined,
-): { primary?: string; fallbacks: string[] } {
-  if (typeof model === "string") {
-    return { primary: normalizeOptional(model), fallbacks: [] };
-  }
-  return {
-    ...(normalizeOptional(model?.primary) ? { primary: normalizeOptional(model?.primary) } : {}),
-    fallbacks: [...(model?.fallbacks ?? [])],
-  };
 }
 
 function extractPathReferencesFromText(text: string): string[] {
@@ -119,26 +103,6 @@ function normalizeInventoryPath(input: string, env: NodeJS.ProcessEnv = process.
   return expanded;
 }
 
-function collectConfigStringEntries(
-  value: unknown,
-  currentPath = "",
-): Array<{ field: string; value: string }> {
-  if (typeof value === "string") {
-    return [{ field: currentPath || "root", value }];
-  }
-  if (!value || typeof value !== "object") {
-    return [];
-  }
-  if (Array.isArray(value)) {
-    return value.flatMap((entry, index) =>
-      collectConfigStringEntries(entry, currentPath ? `${currentPath}.${index}` : String(index)),
-    );
-  }
-  return Object.entries(value as Record<string, unknown>).flatMap(([key, entry]) =>
-    collectConfigStringEntries(entry, currentPath ? `${currentPath}.${key}` : key),
-  );
-}
-
 function isInterestingConfigPathValue(value: string): boolean {
   if (/^https?:\/\//i.test(value)) {
     return false;
@@ -166,19 +130,88 @@ function collectCronPathReferences(job: CronJob): string[] {
   return [];
 }
 
+function collectConfigLitePathEntries(
+  configLite: TaskControlConfigLite | undefined,
+): Array<{ field: string; value: string }> {
+  if (!configLite) {
+    return [];
+  }
+  const entries: Array<{ field: string; value: string }> = [];
+  if (configLite.defaultWorkspace) {
+    entries.push({ field: "agents.defaults.workspace", value: configLite.defaultWorkspace });
+  }
+  for (const agent of configLite.agentWorkspaces) {
+    if (!agent.workspace) {
+      continue;
+    }
+    entries.push({ field: `agents.list.${agent.agentId}.workspace`, value: agent.workspace });
+  }
+  if (configLite.cronStorePath) {
+    entries.push({ field: "cron.store", value: configLite.cronStorePath });
+  }
+  return entries;
+}
+
+function createEmptyWorkspaceInventory(now: number): WorkspaceInventory {
+  return {
+    generatedAt: now,
+    total: 0,
+    entries: [],
+  };
+}
+
+function createEmptyCronInventory(now: number): CronInventory {
+  return {
+    generatedAt: now,
+    total: 0,
+    enabled: 0,
+    disabled: 0,
+    entries: [],
+  };
+}
+
+function createEmptyPathInventory(now: number): PathInventory {
+  return {
+    generatedAt: now,
+    total: 0,
+    entries: [],
+    byCategory: {
+      legacy_home_node: 0,
+      openclaw_home: 0,
+      workspace: 0,
+      report: 0,
+      script: 0,
+      other: 0,
+    },
+  };
+}
+
+function createEmptyProviderInventory(now: number, degraded = false): ProviderInventory {
+  return {
+    generatedAt: now,
+    configReadable: !degraded,
+    providerInventoryDegraded: degraded,
+    configuredProviders: [],
+    defaultFallbacks: [],
+    agentModels: [],
+    cronModels: [],
+    entries: [],
+  };
+}
+
 function resolveWorkspaceEntries(params: {
-  cfg: OpenClawConfig;
+  configLite?: TaskControlConfigLite;
   cronStore: CronStoreFile;
   now: number;
   discoveredPaths: string[];
 }): WorkspaceInventory {
-  const { cfg, cronStore, now } = params;
+  const { configLite, cronStore, now } = params;
   const workspaceMap = new Map<string, WorkspaceInventoryEntry>();
-  const defaultAgentId = resolveDefaultAgentId(cfg);
-  const defaultWorkspace = resolveAgentWorkspaceDir(cfg, defaultAgentId);
+  const explicitDefaultWorkspace = configLite?.defaultWorkspace;
+  const fallbackWorkspace = resolveDefaultAgentWorkspaceDir();
 
   const ensureWorkspace = (workspacePath: string): WorkspaceInventoryEntry => {
-    const normalizedPath = path.resolve(workspacePath);
+    const normalizedPath = normalizeInventoryPath(workspacePath);
     const existing = workspaceMap.get(normalizedPath) ?? {
       path: workspacePath,
       normalizedPath,
@@ -193,19 +226,19 @@ function resolveWorkspaceEntries(params: {
     return existing;
   };
 
-  if (defaultWorkspace) {
-    const entry = ensureWorkspace(defaultWorkspace);
-    entry.configuredDefault = true;
+  if (explicitDefaultWorkspace) {
+    ensureWorkspace(explicitDefaultWorkspace).configuredDefault = true;
+  } else if (fallbackWorkspace) {
+    ensureWorkspace(fallbackWorkspace);
   }
 
-  for (const agentId of listAgentIds(cfg)) {
-    const workspacePath = resolveAgentWorkspaceDir(cfg, agentId);
-    if (!workspacePath) {
+  for (const agent of configLite?.agentWorkspaces ?? []) {
+    if (!agent.workspace) {
       continue;
     }
-    const entry = ensureWorkspace(workspacePath);
-    if (!entry.configuredAgents.includes(agentId)) {
-      entry.configuredAgents.push(agentId);
+    const entry = ensureWorkspace(agent.workspace);
+    if (!entry.configuredAgents.includes(agent.agentId)) {
+      entry.configuredAgents.push(agent.agentId);
     }
   }
 
@@ -220,7 +253,7 @@ function resolveWorkspaceEntries(params: {
       if (!ref.includes("workspace")) {
         continue;
       }
-      const entry = ensureWorkspace(normalizeInventoryPath(ref));
+      const entry = ensureWorkspace(ref);
       if (!entry.referencedByCronIds.includes(job.id)) {
         entry.referencedByCronIds.push(job.id);
       }
@@ -229,7 +262,9 @@ function resolveWorkspaceEntries(params: {
 
   return {
     generatedAt: now,
-    ...(defaultWorkspace ? { primaryWorkspace: path.resolve(defaultWorkspace) } : {}),
+    ...(explicitDefaultWorkspace
+      ? { primaryWorkspace: normalizeInventoryPath(explicitDefaultWorkspace) }
+      : {}),
     total: workspaceMap.size,
     entries: [...workspaceMap.values()]
       .map((entry) => ({
@@ -278,7 +313,7 @@ function buildCronInventory(cronStore: CronStoreFile, now: number): CronInventor
 }
 
 async function buildPathInventory(params: {
-  cfg: OpenClawConfig;
+  configLite?: TaskControlConfigLite;
   cronStore: CronStoreFile;
   now: number;
 }): Promise<PathInventory> {
@@ -310,7 +345,7 @@ async function buildPathInventory(params: {
     });
   };
 
-  for (const entry of collectConfigStringEntries(params.cfg)) {
+  for (const entry of collectConfigLitePathEntries(params.configLite)) {
     if (!isInterestingConfigPathValue(entry.value)) {
       continue;
     }
@@ -347,23 +382,19 @@ async function buildPathInventory(params: {
 }
 
 function buildProviderInventory(params: {
-  cfg: OpenClawConfig;
+  configLite?: TaskControlConfigLite;
   cronStore: CronStoreFile;
   now: number;
+  degraded: boolean;
 }): ProviderInventory {
-  const configuredProviders = Object.keys(params.cfg.models?.providers ?? {}).toSorted();
-  const defaultModelRouting = resolveModelRouting(params.cfg.agents?.defaults?.model);
-  const defaultPrimary = defaultModelRouting.primary;
-  const defaultFallbacks = defaultModelRouting.fallbacks;
-  const agentModels = listAgentIds(params.cfg).map((agentId) => {
-    const agent = (params.cfg.agents?.list ?? []).find((entry) => entry?.id === agentId);
-    const routing = resolveModelRouting(agent?.model);
-    return {
-      agentId,
-      ...(routing.primary ? { primary: routing.primary } : {}),
-      fallbacks: routing.fallbacks,
-    };
-  });
+  const configuredProviders = [...(params.configLite?.configuredProviders ?? [])].toSorted();
+  const defaultPrimary = params.configLite?.providerRefs.defaultPrimary;
+  const defaultFallbacks = [...(params.configLite?.providerRefs.defaultFallbacks ?? [])];
+  const agentModels = (params.configLite?.providerRefs.agents ?? []).map((agent) => ({
+    agentId: agent.agentId,
+    ...(agent.primary ? { primary: agent.primary } : {}),
+    fallbacks: [...agent.fallbacks],
+  }));
   const cronModels = params.cronStore.jobs
     .filter((job) => job.payload.kind === "agentTurn")
     .map((job) => {
@@ -407,8 +438,7 @@ function buildProviderInventory(params: {
     ensureProvider(provider).referencedByDefault = true;
   }
   for (const agent of agentModels) {
-    const refs = [agent.primary, ...agent.fallbacks];
-    for (const ref of refs) {
+    for (const ref of [agent.primary, ...agent.fallbacks]) {
       const provider = extractProviderId(ref);
       if (!provider) {
         continue;
@@ -417,8 +447,7 @@ function buildProviderInventory(params: {
     }
   }
   for (const cron of cronModels) {
-    const refs = [cron.model, ...cron.fallbacks];
-    for (const ref of refs) {
+    for (const ref of [cron.model, ...cron.fallbacks]) {
       const provider = extractProviderId(ref);
       if (!provider) {
         continue;
@@ -429,6 +458,8 @@ function buildProviderInventory(params: {
 
   return {
     generatedAt: params.now,
+    configReadable: !params.degraded,
+    providerInventoryDegraded: params.degraded,
     configuredProviders,
     ...(defaultPrimary ? { defaultPrimary } : {}),
     defaultFallbacks,
@@ -440,19 +471,56 @@ function buildProviderInventory(params: {
   };
 }
 
+async function resolveConfigLiteForInventory(
+  options: BuildTaskControlInventoryOptions,
+): Promise<{ configLite?: TaskControlConfigLite; warning?: string }> {
+  if (options.configLite) {
+    return { configLite: options.configLite };
+  }
+  if (options.cfg) {
+    return { configLite: buildTaskControlConfigLite(options.cfg) };
+  }
+  const configLiteResult = await readTaskControlConfigLite({ stateDir: options.stateDir });
+  if (!configLiteResult.ok) {
+    return { warning: configLiteResult.error };
+  }
+  return { configLite: configLiteResult.config };
+}
+
 export async function buildTaskControlInventory(
   options: BuildTaskControlInventoryOptions = {},
 ): Promise<TaskControlInventory> {
   const now = options.now ?? Date.now();
-  const cfg = options.cfg ?? loadConfig();
-  const cronStore =
-    options.cronStore ??
-    (await loadCronStore(
-      resolveCronStorePath((cfg.cron as { store?: string } | undefined)?.store),
-    ));
+  const warnings: string[] = [];
+  const inventoryStatus: Record<
+    keyof TaskControlInventory["inventoryStatus"],
+    TaskControlInventoryStatus
+  > = {
+    workspace: "ok",
+    cron: "ok",
+    path: "ok",
+    provider: "ok",
+  };
+
+  const { configLite, warning: configWarning } = await resolveConfigLiteForInventory(options);
+  if (configWarning) {
+    inventoryStatus.provider = "degraded";
+    warnings.push(`provider inventory degraded: ${configWarning}`);
+  }
+
+  let cronStore = options.cronStore ?? ({ version: 1, jobs: [] } as CronStoreFile);
+  if (!options.cronStore) {
+    try {
+      cronStore = await loadCronStore(resolveCronStorePath(configLite?.cronStorePath));
+    } catch (error) {
+      inventoryStatus.cron = "degraded";
+      warnings.push(`cron inventory degraded: failed to load cron store: ${String(error)}`);
+      cronStore = { version: 1, jobs: [] };
+    }
+  }
 
   const discoveredPaths = [
-    ...collectConfigStringEntries(cfg)
+    ...collectConfigLitePathEntries(configLite)
       .map((entry) => entry.value)
       .filter(isInterestingConfigPathValue)
       .map((value) => normalizeInventoryPath(value)),
@@ -461,40 +529,80 @@ export async function buildTaskControlInventory(
     ),
   ];
 
-  const workspaceInventory = resolveWorkspaceEntries({
-    cfg,
-    cronStore,
-    now,
-    discoveredPaths,
-  });
-  const pathInventory = await buildPathInventory({ cfg, cronStore, now });
-  const cronInventory = buildCronInventory(cronStore, now);
-  const providerInventory = buildProviderInventory({ cfg, cronStore, now });
-
-  const workspaceEntries = await Promise.all(
-    workspaceInventory.entries.map(async (entry) => {
-      const primaryMarker = await pathExists(path.join(entry.normalizedPath, ".PRIMARY_WORKSPACE"));
-      return {
-        ...entry,
-        exists: (await pathExists(entry.normalizedPath)) === true,
-        primaryMarker: primaryMarker === true,
-        isPrimary: primaryMarker === true || entry.configuredDefault,
-      };
-    }),
-  );
-
-  return {
-    generatedAt: now,
-    workspaceInventory: {
-      ...workspaceInventory,
+  let workspaceInventory = createEmptyWorkspaceInventory(now);
+  try {
+    const baseWorkspaceInventory = resolveWorkspaceEntries({
+      configLite,
+      cronStore,
+      now,
+      discoveredPaths,
+    });
+    const workspaceEntries = await Promise.all(
+      baseWorkspaceInventory.entries.map(async (entry) => {
+        const primaryMarker = await pathExists(
+          path.join(entry.normalizedPath, ".PRIMARY_WORKSPACE"),
+        );
+        return {
+          ...entry,
+          exists: (await pathExists(entry.normalizedPath)) === true,
+          primaryMarker: primaryMarker === true,
+          isPrimary: primaryMarker === true || entry.configuredDefault,
+        };
+      }),
+    );
+    workspaceInventory = {
+      ...baseWorkspaceInventory,
       entries: workspaceEntries,
       ...(workspaceEntries.find((entry) => entry.isPrimary)
         ? { primaryWorkspace: workspaceEntries.find((entry) => entry.isPrimary)?.normalizedPath }
         : {}),
-    },
+    };
+  } catch (error) {
+    inventoryStatus.workspace = "degraded";
+    warnings.push(`workspace inventory degraded: ${String(error)}`);
+  }
+
+  let cronInventory = createEmptyCronInventory(now);
+  try {
+    cronInventory = buildCronInventory(cronStore, now);
+  } catch (error) {
+    inventoryStatus.cron = "degraded";
+    warnings.push(`cron inventory degraded: ${String(error)}`);
+  }
+
+  let pathInventory = createEmptyPathInventory(now);
+  try {
+    pathInventory = await buildPathInventory({ configLite, cronStore, now });
+  } catch (error) {
+    inventoryStatus.path = "degraded";
+    warnings.push(`path inventory degraded: ${String(error)}`);
+  }
+
+  let providerInventory = createEmptyProviderInventory(
+    now,
+    inventoryStatus.provider === "degraded",
+  );
+  try {
+    providerInventory = buildProviderInventory({
+      configLite,
+      cronStore,
+      now,
+      degraded: inventoryStatus.provider === "degraded",
+    });
+  } catch (error) {
+    inventoryStatus.provider = "degraded";
+    warnings.push(`provider inventory degraded: ${String(error)}`);
+    providerInventory = createEmptyProviderInventory(now, true);
+  }
+
+  return {
+    generatedAt: now,
+    workspaceInventory,
     cronInventory,
     pathInventory,
     providerInventory,
+    inventoryStatus,
+    warnings,
   };
 }
 

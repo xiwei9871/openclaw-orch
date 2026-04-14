@@ -118,6 +118,52 @@ describe("task control inventory", () => {
     });
   });
 
+  it("degrades provider inventory when config-lite parsing fails without blocking pure-read data", async () => {
+    await withTempDir({ prefix: "openclaw-inventory-invalid-config-" }, async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      await fs.writeFile(path.join(root, "openclaw.json"), "{ invalid json", "utf8");
+      const cronStore: CronStoreFile = {
+        version: 1,
+        jobs: [
+          {
+            id: "job-1",
+            name: "repair-me",
+            enabled: true,
+            createdAtMs: 1,
+            updatedAtMs: 1,
+            schedule: { kind: "cron", expr: "0 8 * * *", tz: "Asia/Shanghai" },
+            sessionTarget: "isolated",
+            wakeMode: "now",
+            payload: {
+              kind: "agentTurn",
+              message: "read ~/.openclaw/workspace/FOUNDER_OS.md",
+              model: "openai/gpt-5",
+            },
+            delivery: { mode: "none" },
+            state: {},
+          },
+        ],
+      };
+
+      const inventory = await buildTaskControlInventory({
+        now: Date.UTC(2026, 3, 14, 0, 0, 0),
+        cronStore,
+        stateDir: root,
+      });
+
+      expect(inventory.workspaceInventory.total).toBeGreaterThanOrEqual(1);
+      expect(inventory.cronInventory.total).toBe(1);
+      expect(inventory.pathInventory.total).toBeGreaterThanOrEqual(1);
+      expect(inventory.inventoryStatus.workspace).toBe("ok");
+      expect(inventory.inventoryStatus.cron).toBe("ok");
+      expect(inventory.inventoryStatus.path).toBe("ok");
+      expect(inventory.inventoryStatus.provider).toBe("degraded");
+      expect(inventory.providerInventory.configReadable).toBe(false);
+      expect(inventory.providerInventory.providerInventoryDegraded).toBe(true);
+      expect(inventory.warnings[0]).toContain("provider inventory degraded");
+    });
+  });
+
   it("writes inventory files into the requested directory", async () => {
     await withTempDir({ prefix: "openclaw-inventory-write-" }, async (root) => {
       const inventory = await buildTaskControlInventory({

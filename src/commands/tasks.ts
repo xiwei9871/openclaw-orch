@@ -676,7 +676,18 @@ export async function tasksControlCommand(
           healthModel: model.healthModel,
           errorClassification: model.errorClassification,
           projectionLayer,
-          ...(inventory ? { inventory } : {}),
+          ...(inventory
+            ? {
+                inventory: {
+                  workspaceInventory: inventory.workspaceInventory,
+                  cronInventory: inventory.cronInventory,
+                  pathInventory: inventory.pathInventory,
+                  providerInventory: inventory.providerInventory,
+                },
+                inventoryStatus: inventory.inventoryStatus,
+                warnings: inventory.warnings,
+              }
+            : {}),
           ...(cronPathRepair ? { cronPathRepair } : {}),
           ...(inventoryFiles ? { inventoryFiles } : {}),
           ...(summaryFilePath ? { summaryFilePath } : {}),
@@ -712,6 +723,11 @@ export async function tasksControlCommand(
         `Inventory: ${inventory.workspaceInventory.total} workspaces · ${inventory.cronInventory.total} cron jobs · ${inventory.pathInventory.total} path refs · ${inventory.providerInventory.entries.length} providers`,
       ),
     );
+    if (inventory.warnings.length > 0) {
+      for (const warning of inventory.warnings) {
+        runtime.log(info(`Inventory warning: ${warning}`));
+      }
+    }
   }
   if (inventoryFiles) {
     runtime.log(info(`Inventory dir: ${inventoryFiles.rootDir}`));

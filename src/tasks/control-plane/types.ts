@@ -304,6 +304,8 @@ export type ProviderInventoryEntry = {
 
 export type ProviderInventory = {
   generatedAt: number;
+  configReadable: boolean;
+  providerInventoryDegraded: boolean;
   configuredProviders: string[];
   defaultPrimary?: string;
   defaultFallbacks: string[];
@@ -321,12 +323,21 @@ export type ProviderInventory = {
   entries: ProviderInventoryEntry[];
 };
 
+export type TaskControlInventoryStatus = "ok" | "degraded";
+
 export type TaskControlInventory = {
   generatedAt: number;
   workspaceInventory: WorkspaceInventory;
   cronInventory: CronInventory;
   pathInventory: PathInventory;
   providerInventory: ProviderInventory;
+  inventoryStatus: {
+    workspace: TaskControlInventoryStatus;
+    cron: TaskControlInventoryStatus;
+    path: TaskControlInventoryStatus;
+    provider: TaskControlInventoryStatus;
+  };
+  warnings: string[];
 };
 
 export type CronPathRepairEntry = {
