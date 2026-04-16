@@ -256,6 +256,8 @@ export type CronInventoryEntry = {
   nextRunAtMs?: number;
   lastRunAtMs?: number;
   lastStatus?: string;
+  operationalStatus: "healthy" | "alerting" | "unknown" | "disabled";
+  historicalErrorOnly: boolean;
   consecutiveErrors: number;
   lastError?: string;
   pathReferences: string[];
@@ -266,6 +268,13 @@ export type CronInventory = {
   total: number;
   enabled: number;
   disabled: number;
+  summary: {
+    enabledHealthy: number;
+    enabledAlerting: number;
+    enabledUnknown: number;
+    disabledHealthy: number;
+    disabledWithHistoricalErrors: number;
+  };
   entries: CronInventoryEntry[];
 };
 

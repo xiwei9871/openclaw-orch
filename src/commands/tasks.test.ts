@@ -311,7 +311,16 @@ describe("tasks commands", () => {
         const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
           inventory: {
             workspaceInventory: { total: number };
-            cronInventory: { total: number };
+            cronInventory: {
+              total: number;
+              summary: {
+                enabledHealthy: number;
+                enabledAlerting: number;
+                enabledUnknown: number;
+                disabledHealthy: number;
+                disabledWithHistoricalErrors: number;
+              };
+            };
             pathInventory: { total: number };
             providerInventory: { entries: unknown[] };
           };
@@ -330,6 +339,7 @@ describe("tasks commands", () => {
 
         expect(payload.inventory.workspaceInventory.total).toBeGreaterThanOrEqual(0);
         expect(payload.inventory.cronInventory.total).toBeGreaterThanOrEqual(0);
+        expect(payload.inventory.cronInventory.summary).toBeDefined();
         expect(payload.inventory.pathInventory.total).toBeGreaterThanOrEqual(0);
         expect(payload.inventory.providerInventory.entries).toBeDefined();
         expect(payload.inventoryStatus.provider).toBeDefined();
@@ -339,6 +349,27 @@ describe("tasks commands", () => {
           fs.readFile(payload.inventoryFiles.files.workspaces, "utf8"),
         ).resolves.toContain('"entries":');
       });
+    });
+  });
+
+  it("logs cron operational summary in human-readable tasks control output", async () => {
+    await withTaskCommandStateDir(async () => {
+      const runtime = createRuntime();
+
+      await tasksControlCommand(
+        {
+          inventory: true,
+        },
+        runtime,
+      );
+
+      const output = vi
+        .mocked(runtime.log)
+        .mock.calls.map((call) => String(call[0]))
+        .join("\n");
+
+      expect(output).toContain("Cron operational:");
+      expect(output).toContain("enabled healthy");
     });
   });
 

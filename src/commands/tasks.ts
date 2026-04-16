@@ -723,6 +723,15 @@ export async function tasksControlCommand(
         `Inventory: ${inventory.workspaceInventory.total} workspaces · ${inventory.cronInventory.total} cron jobs · ${inventory.pathInventory.total} path refs · ${inventory.providerInventory.entries.length} providers`,
       ),
     );
+    const alertingCronNames = inventory.cronInventory.entries
+      .filter((entry) => entry.operationalStatus === "alerting")
+      .map((entry) => entry.name)
+      .slice(0, 3);
+    runtime.log(
+      info(
+        `Cron operational: enabled healthy ${inventory.cronInventory.summary.enabledHealthy} · enabled alerting ${inventory.cronInventory.summary.enabledAlerting} · enabled unknown ${inventory.cronInventory.summary.enabledUnknown} · disabled historical ${inventory.cronInventory.summary.disabledWithHistoricalErrors}${alertingCronNames.length > 0 ? ` · focus ${alertingCronNames.join(", ")}` : ""}`,
+      ),
+    );
     if (inventory.warnings.length > 0) {
       for (const warning of inventory.warnings) {
         runtime.log(info(`Inventory warning: ${warning}`));

@@ -166,6 +166,13 @@ function createEmptyCronInventory(now: number): CronInventory {
     total: 0,
     enabled: 0,
     disabled: 0,
+    summary: {
+      enabledHealthy: 0,
+      enabledAlerting: 0,
+      enabledUnknown: 0,
+      disabledHealthy: 0,
+      disabledWithHistoricalErrors: 0,
+    },
     entries: [],
   };
 }
@@ -276,12 +283,51 @@ function resolveWorkspaceEntries(params: {
   };
 }
 
+function resolveCronExecutionStatus(job: CronJob): string | undefined {
+  return job.state.lastRunStatus ?? job.state.lastStatus;
+}
+
+function classifyCronOperationalState(job: CronJob): {
+  operationalStatus: CronInventoryEntry["operationalStatus"];
+  historicalErrorOnly: boolean;
+} {
+  const lastStatus = resolveCronExecutionStatus(job);
+  const hasErrorState =
+    lastStatus === "error" ||
+    (job.state.consecutiveErrors ?? 0) > 0 ||
+    Boolean(normalizeOptional(job.state.lastError));
+
+  if (!job.enabled) {
+    return {
+      operationalStatus: "disabled",
+      historicalErrorOnly: hasErrorState,
+    };
+  }
+  if (hasErrorState) {
+    return {
+      operationalStatus: "alerting",
+      historicalErrorOnly: false,
+    };
+  }
+  if (!lastStatus) {
+    return {
+      operationalStatus: "unknown",
+      historicalErrorOnly: false,
+    };
+  }
+  return {
+    operationalStatus: "healthy",
+    historicalErrorOnly: false,
+  };
+}
+
 function buildCronInventory(cronStore: CronStoreFile, now: number): CronInventory {
   const entries: CronInventoryEntry[] = cronStore.jobs.map((job) => {
     const payload = job.payload;
     const payloadKind = payload?.kind;
     const model = payloadKind === "agentTurn" ? payload.model : undefined;
     const fallbacks = payloadKind === "agentTurn" ? [...(payload.fallbacks ?? [])] : [];
+    const { operationalStatus, historicalErrorOnly } = classifyCronOperationalState(job);
     return {
       id: job.id,
       name: job.name,
@@ -296,18 +342,37 @@ function buildCronInventory(cronStore: CronStoreFile, now: number): CronInventor
       fallbacks,
       ...(typeof job.state.nextRunAtMs === "number" ? { nextRunAtMs: job.state.nextRunAtMs } : {}),
       ...(typeof job.state.lastRunAtMs === "number" ? { lastRunAtMs: job.state.lastRunAtMs } : {}),
-      ...(job.state.lastStatus ? { lastStatus: job.state.lastStatus } : {}),
+      ...(resolveCronExecutionStatus(job) ? { lastStatus: resolveCronExecutionStatus(job) } : {}),
+      operationalStatus,
+      historicalErrorOnly,
       consecutiveErrors: job.state.consecutiveErrors ?? 0,
       ...(job.state.lastError ? { lastError: job.state.lastError } : {}),
       pathReferences: collectCronPathReferences(job),
     };
   });
 
+  const summary = {
+    enabledHealthy: entries.filter(
+      (entry) => entry.enabled && entry.operationalStatus === "healthy",
+    ).length,
+    enabledAlerting: entries.filter(
+      (entry) => entry.enabled && entry.operationalStatus === "alerting",
+    ).length,
+    enabledUnknown: entries.filter(
+      (entry) => entry.enabled && entry.operationalStatus === "unknown",
+    ).length,
+    disabledHealthy: entries.filter((entry) => !entry.enabled && !entry.historicalErrorOnly).length,
+    disabledWithHistoricalErrors: entries.filter(
+      (entry) => !entry.enabled && entry.historicalErrorOnly,
+    ).length,
+  };
+
   return {
     generatedAt: now,
     total: entries.length,
     enabled: entries.filter((entry) => entry.enabled).length,
     disabled: entries.filter((entry) => !entry.enabled).length,
+    summary,
     entries: entries.toSorted((left, right) => left.name.localeCompare(right.name)),
   };
 }
