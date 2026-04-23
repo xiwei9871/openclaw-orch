@@ -243,6 +243,7 @@ export function createMockCronStateForJobs(params: {
     timer: null,
     storeLoadedAtMs: nowMs,
     storeFileMtimeMs: null,
+    networkRecovery: {},
     op: Promise.resolve(),
     warnedDisabled: false,
     deps: {
