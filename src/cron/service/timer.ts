@@ -87,6 +87,14 @@ type StartupCatchupPlan = {
   deferredJobIds: string[];
 };
 
+type CatchupScope = "restart" | "network-recovery";
+
+type CatchupOptions = {
+  skipJobIds?: ReadonlySet<string>;
+  criticalJobIds?: ReadonlySet<string>;
+  recoveryMode?: CatchupScope;
+};
+
 export async function executeJobCoreWithTimeout(
   state: CronServiceState,
   job: CronJob,
@@ -689,7 +697,10 @@ export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): P
   ) {
     return;
   }
-  await runMissedJobs(state);
+  await runMissedJobs(state, {
+    criticalJobIds: FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS,
+    recoveryMode: "network-recovery",
+  });
   writeNetworkRecoveryTimestamps(state, { lastCatchupTriggered: now });
 }
 
@@ -887,6 +898,8 @@ export async function onTimer(state: CronServiceState) {
         await persist(state);
       });
     }
+
+    await maybeRunNetworkRecoveryCatchup(state);
   } finally {
     // Piggyback session reaper on timer tick (self-throttled to every 5 min).
     // Placed in `finally` so the reaper runs even when a long-running job keeps
@@ -1039,10 +1052,7 @@ function collectRunnableJobs(
   );
 }
 
-export async function runMissedJobs(
-  state: CronServiceState,
-  opts?: { skipJobIds?: ReadonlySet<string> },
-) {
+export async function runMissedJobs(state: CronServiceState, opts?: CatchupOptions) {
   const plan = await planStartupCatchup(state, opts);
   if (plan.candidates.length === 0 && plan.deferredJobIds.length === 0) {
     return;
@@ -1054,7 +1064,7 @@ export async function runMissedJobs(
 
 async function planStartupCatchup(
   state: CronServiceState,
-  opts?: { skipJobIds?: ReadonlySet<string> },
+  opts?: CatchupOptions,
 ): Promise<StartupCatchupPlan> {
   const maxImmediate = Math.max(
     0,
@@ -1071,6 +1081,18 @@ async function planStartupCatchup(
       skipJobIds: opts?.skipJobIds,
       skipAtIfAlreadyRan: true,
       allowCronMissedRunByLastRun: true,
+    }).filter((job) => {
+      if (opts?.criticalJobIds && !opts.criticalJobIds.has(job.id)) {
+        return false;
+      }
+      if (opts?.recoveryMode !== "network-recovery") {
+        return true;
+      }
+      return (
+        isNetworkRecoverableCronError(job.state.lastError) ||
+        (typeof state.networkRecovery.lastNetworkFailureAtMs === "number" &&
+          (job.state.lastRunAtMs ?? 0) <= state.networkRecovery.lastNetworkFailureAtMs)
+      );
     });
     if (missed.length === 0) {
       return { candidates: [], deferredJobIds: [] };
