@@ -7,6 +7,7 @@ import {
 } from "./service.test-harness.js";
 import {
   isNetworkRecoverableCronError,
+  maybeProbeNetworkRecovery,
   maybeRunNetworkRecoveryCatchup,
   onTimer,
 } from "./service/timer.js";
@@ -240,7 +241,7 @@ describe("cron network recovery catch-up", () => {
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
   });
 
-  it("replays a critical network-failed job even when nextRunAtMs already moved to a future slot", async () => {
+  it("replays a critical network-failed job with a future nextRunAtMs only after probe-confirmed recovery", async () => {
     const now = Date.parse("2026-02-06T10:05:00.000Z");
     const scheduledSlot = Date.parse("2026-02-06T10:01:00.000Z");
     const futureNextRunAtMs = Date.parse("2026-02-06T10:11:00.000Z");
@@ -267,13 +268,17 @@ describe("cron network recovery catch-up", () => {
         },
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
-      lastStableSuccessAtMs: now - 60_000,
+    Object.assign(state.networkRecovery as Record<string, unknown>, {
+      lastNetworkFailureAtMs: now - 1_000,
+      nextProbeAtMs: now,
+      consecutiveProbeFailures: 0,
       lastErrorText: "network connection error",
-    };
+    });
 
-    await maybeRunNetworkRecoveryCatchup(state);
+    await maybeProbeNetworkRecovery(state, {
+      runFeishuProbe: vi.fn().mockResolvedValue(true),
+      runLlmProbe: vi.fn().mockResolvedValue(true),
+    } as never);
 
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(

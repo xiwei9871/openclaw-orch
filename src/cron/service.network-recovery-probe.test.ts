@@ -10,23 +10,6 @@ const { logger: noopLogger, makeStorePath } = setupCronServiceSuite({
 
 const FOUNDER_OS_CRITICAL_JOB_ID = "c0ff4e45-9a3c-417e-a324-a95d65a16a28";
 
-type ProbeTrackedState = ReturnType<typeof createRunningCronServiceState> & {
-  networkRecovery: {
-    lastNetworkFailureAtMs?: number;
-    lastStableSuccessAtMs?: number;
-    lastRecoveryCatchupTriggeredAtMs?: number;
-    lastErrorText?: string;
-    nextProbeAtMs?: number;
-    consecutiveProbeFailures?: number;
-    lastFeishuProbeOkAtMs?: number;
-    lastLlmProbeOkAtMs?: number;
-  };
-  deps: ReturnType<typeof createRunningCronServiceState>["deps"] & {
-    probeFeishuNetwork?: ReturnType<typeof vi.fn>;
-    probeLlmNetwork?: ReturnType<typeof vi.fn>;
-  };
-};
-
 function createCriticalReplayJob(params: {
   id?: string;
   text: string;
@@ -55,34 +38,34 @@ describe("cron network recovery probes", () => {
       log: noopLogger,
       nowMs: () => now,
       jobs: [],
-    }) as ProbeTrackedState;
-    state.deps.probeFeishuNetwork = vi.fn().mockResolvedValue(true);
-    state.deps.probeLlmNetwork = vi.fn().mockResolvedValue(true);
+    });
+    const runFeishuProbe = vi.fn().mockResolvedValue(true);
+    const runLlmProbe = vi.fn().mockResolvedValue(true);
     state.networkRecovery = {};
 
-    await maybeProbeNetworkRecovery(state);
+    await maybeProbeNetworkRecovery(state, { runFeishuProbe, runLlmProbe } as never);
 
-    expect(state.deps.probeFeishuNetwork).not.toHaveBeenCalled();
-    expect(state.deps.probeLlmNetwork).not.toHaveBeenCalled();
+    expect(runFeishuProbe).not.toHaveBeenCalled();
+    expect(runLlmProbe).not.toHaveBeenCalled();
 
-    state.networkRecovery = {
+    Object.assign(state.networkRecovery as Record<string, unknown>, {
       lastNetworkFailureAtMs: now - 1_000,
       nextProbeAtMs: now,
       consecutiveProbeFailures: 0,
       lastErrorText: "network connection error",
-    };
+    });
 
-    await maybeProbeNetworkRecovery(state);
+    await maybeProbeNetworkRecovery(state, { runFeishuProbe, runLlmProbe } as never);
 
-    expect(state.deps.probeFeishuNetwork).toHaveBeenCalledTimes(1);
-    expect(state.deps.probeLlmNetwork).toHaveBeenCalledTimes(1);
+    expect(runFeishuProbe).toHaveBeenCalledTimes(1);
+    expect(runLlmProbe).toHaveBeenCalledTimes(1);
   });
 
   it("backs off probe retries from 15 seconds to 30 seconds to 60 seconds", () => {
-    expect(resolveNextNetworkProbeDelayMs(0)).toBe(15_000);
-    expect(resolveNextNetworkProbeDelayMs(1)).toBe(30_000);
-    expect(resolveNextNetworkProbeDelayMs(2)).toBe(60_000);
-    expect(resolveNextNetworkProbeDelayMs(3)).toBe(60_000);
+    expect(resolveNextNetworkProbeDelayMs(undefined)).toBe(15_000);
+    expect(resolveNextNetworkProbeDelayMs(15_000)).toBe(30_000);
+    expect(resolveNextNetworkProbeDelayMs(30_000)).toBe(60_000);
+    expect(resolveNextNetworkProbeDelayMs(60_000)).toBe(60_000);
   });
 
   it("does not recover when the Feishu probe succeeds but the LLM probe fails", async () => {
@@ -98,17 +81,18 @@ describe("cron network recovery probes", () => {
           nextRunAtMs: now - 5 * 60_000,
         }),
       ],
-    }) as ProbeTrackedState;
-    state.deps.probeFeishuNetwork = vi.fn().mockResolvedValue(true);
-    state.deps.probeLlmNetwork = vi.fn().mockResolvedValue(false);
-    state.networkRecovery = {
+    });
+    Object.assign(state.networkRecovery as Record<string, unknown>, {
       lastNetworkFailureAtMs: now - 1_000,
       nextProbeAtMs: now,
       consecutiveProbeFailures: 0,
       lastErrorText: "network connection error",
-    };
+    });
 
-    await maybeProbeNetworkRecovery(state);
+    await maybeProbeNetworkRecovery(state, {
+      runFeishuProbe: vi.fn().mockResolvedValue(true),
+      runLlmProbe: vi.fn().mockResolvedValue(false),
+    } as never);
 
     expect(state.deps.enqueueSystemEvent).not.toHaveBeenCalled();
     expect(state.deps.requestHeartbeatNow).not.toHaveBeenCalled();
@@ -127,17 +111,18 @@ describe("cron network recovery probes", () => {
           nextRunAtMs: now - 5 * 60_000,
         }),
       ],
-    }) as ProbeTrackedState;
-    state.deps.probeFeishuNetwork = vi.fn().mockResolvedValue(false);
-    state.deps.probeLlmNetwork = vi.fn().mockResolvedValue(true);
-    state.networkRecovery = {
+    });
+    Object.assign(state.networkRecovery as Record<string, unknown>, {
       lastNetworkFailureAtMs: now - 1_000,
       nextProbeAtMs: now,
       consecutiveProbeFailures: 0,
       lastErrorText: "network connection error",
-    };
+    });
 
-    await maybeProbeNetworkRecovery(state);
+    await maybeProbeNetworkRecovery(state, {
+      runFeishuProbe: vi.fn().mockResolvedValue(false),
+      runLlmProbe: vi.fn().mockResolvedValue(true),
+    } as never);
 
     expect(state.deps.enqueueSystemEvent).not.toHaveBeenCalled();
     expect(state.deps.requestHeartbeatNow).not.toHaveBeenCalled();
@@ -156,17 +141,18 @@ describe("cron network recovery probes", () => {
           nextRunAtMs: now - 5 * 60_000,
         }),
       ],
-    }) as ProbeTrackedState;
-    state.deps.probeFeishuNetwork = vi.fn().mockResolvedValue(true);
-    state.deps.probeLlmNetwork = vi.fn().mockResolvedValue(true);
-    state.networkRecovery = {
+    });
+    Object.assign(state.networkRecovery as Record<string, unknown>, {
       lastNetworkFailureAtMs: now - 1_000,
       nextProbeAtMs: now,
       consecutiveProbeFailures: 0,
       lastErrorText: "network connection error",
-    };
+    });
 
-    await maybeProbeNetworkRecovery(state);
+    await maybeProbeNetworkRecovery(state, {
+      runFeishuProbe: vi.fn().mockResolvedValue(true),
+      runLlmProbe: vi.fn().mockResolvedValue(true),
+    } as never);
 
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(
