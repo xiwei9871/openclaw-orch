@@ -10,6 +10,15 @@ const { logger: noopLogger, makeStorePath } = setupCronServiceSuite({
 
 const FOUNDER_OS_CRITICAL_JOB_ID = "c0ff4e45-9a3c-417e-a324-a95d65a16a28";
 
+type RecoveryTrackedState = ReturnType<typeof createRunningCronServiceState> & {
+  networkRecovery: {
+    lastRecoverableErrorAtMs?: number;
+    stableSinceMs?: number;
+    lastCatchupAtMs?: number;
+    lastErrorText?: string;
+  };
+};
+
 function createOverdueSystemJob(params: {
   id: string;
   name?: string;
@@ -32,28 +41,14 @@ function createOverdueSystemJob(params: {
 
 describe("cron network recovery catch-up", () => {
   it("classifies ENOTFOUND and normalized network errors as recoverable", () => {
-    expect(
-      isNetworkRecoverableCronError(
-        Object.assign(new Error("dial tcp: lookup api.example.com: no such host"), {
-          code: "ENOTFOUND",
-        }),
-      ),
-    ).toBe(true);
+    expect(isNetworkRecoverableCronError("getaddrinfo ENOTFOUND api.example.com")).toBe(true);
     expect(isNetworkRecoverableCronError("network error")).toBe(true);
   });
 
   it("does not classify HTTP 401 or local write failures as recoverable", () => {
+    expect(isNetworkRecoverableCronError("401 Unauthorized")).toBe(false);
     expect(
-      isNetworkRecoverableCronError(
-        Object.assign(new Error("401 Unauthorized"), {
-          status: 401,
-        }),
-      ),
-    ).toBe(false);
-    expect(
-      isNetworkRecoverableCronError(
-        new Error("EACCES: permission denied, open '/tmp/cron-jobs.json' for write"),
-      ),
+      isNetworkRecoverableCronError("EACCES: permission denied, open '/tmp/cron-jobs.json'"),
     ).toBe(false);
   });
 
@@ -72,12 +67,14 @@ describe("cron network recovery catch-up", () => {
           nextRunAtMs: now - 5 * 60_000,
         }),
       ],
-    });
-
-    await maybeRunNetworkRecoveryCatchup(state, {
+    }) as RecoveryTrackedState;
+    state.networkRecovery = {
+      lastRecoverableErrorAtMs: now - 59_000,
       stableSinceMs: now - 59_000,
-      lastError: new Error("network error"),
-    });
+      lastErrorText: "network error",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
 
     expect(state.deps.enqueueSystemEvent).not.toHaveBeenCalled();
     expect(state.deps.requestHeartbeatNow).not.toHaveBeenCalled();
@@ -104,14 +101,14 @@ describe("cron network recovery catch-up", () => {
           nextRunAtMs: now - 5 * 60_000,
         }),
       ],
-    });
-
-    await maybeRunNetworkRecoveryCatchup(state, {
+    }) as RecoveryTrackedState;
+    state.networkRecovery = {
+      lastRecoverableErrorAtMs: now - 60_000,
       stableSinceMs: now - 60_000,
-      lastError: Object.assign(new Error("getaddrinfo ENOTFOUND api.example.com"), {
-        code: "ENOTFOUND",
-      }),
-    });
+      lastErrorText: "getaddrinfo ENOTFOUND api.example.com",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
 
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(
@@ -136,21 +133,58 @@ describe("cron network recovery catch-up", () => {
           nextRunAtMs: now - 5 * 60_000,
         }),
       ],
-    });
-
-    await maybeRunNetworkRecoveryCatchup(state, {
+    }) as RecoveryTrackedState;
+    state.networkRecovery = {
+      lastRecoverableErrorAtMs: now - 60_000,
       stableSinceMs: now - 60_000,
-      lastError: new Error("network error"),
-    });
+      lastErrorText: "network error",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
 
     now += 30_000;
 
-    await maybeRunNetworkRecoveryCatchup(state, {
-      stableSinceMs: now - 90_000,
-      lastError: new Error("network error"),
-    });
+    await maybeRunNetworkRecoveryCatchup(state);
 
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows one catch-up per recovery window instead of becoming a permanent latch", async () => {
+    let now = Date.parse("2026-02-06T10:05:00.000Z");
+    const store = await makeStorePath();
+    const state = createRunningCronServiceState({
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      jobs: [
+        createOverdueSystemJob({
+          id: FOUNDER_OS_CRITICAL_JOB_ID,
+          name: "founder-os critical",
+          text: "replay founder critical",
+          nextRunAtMs: now - 5 * 60_000,
+        }),
+      ],
+    }) as RecoveryTrackedState;
+    state.networkRecovery = {
+      lastRecoverableErrorAtMs: now - 60_000,
+      stableSinceMs: now - 60_000,
+      lastErrorText: "network error",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
+
+    now += 5 * 60_000;
+    state.networkRecovery = {
+      lastRecoverableErrorAtMs: now - 61_000,
+      stableSinceMs: now - 61_000,
+      lastCatchupAtMs: now - 5 * 60_000,
+      lastErrorText: "network error",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
+
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(2);
+    expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(2);
   });
 });
