@@ -25,6 +25,10 @@ const FOUNDER_OS_CRITICAL_JOB_IDS = [
   "07084743-7475-446e-8013-63fc2afa88bc",
   "81380d51-2a99-4f03-a8ef-e57e35faeb26",
 ];
+const runProbeRecovery: (
+  state: ProbeRecoveryTrackedState,
+  overrides: ProbeRunnerOverrides,
+) => Promise<void> = maybeProbeNetworkRecovery;
 
 type RecoveryTrackedState = ReturnType<typeof createRunningCronServiceState> & {
   networkRecovery: {
@@ -32,6 +36,18 @@ type RecoveryTrackedState = ReturnType<typeof createRunningCronServiceState> & {
     lastStableSuccessAtMs?: number;
     lastRecoveryCatchupTriggeredAtMs?: number;
     lastErrorText?: string;
+  };
+};
+
+type ProbeRunnerOverrides = {
+  runFeishuProbe: () => Promise<boolean>;
+  runLlmProbe: () => Promise<boolean>;
+};
+
+type ProbeRecoveryTrackedState = RecoveryTrackedState & {
+  networkRecovery: RecoveryTrackedState["networkRecovery"] & {
+    nextProbeAtMs?: number;
+    consecutiveProbeFailures?: number;
   };
 };
 
@@ -79,6 +95,19 @@ function createMissedCronSystemJob(params: {
       lastStatus: "ok",
     },
   };
+}
+
+function markProbeFailureWindow(
+  state: ProbeRecoveryTrackedState,
+  now: number,
+  errorText = "network connection error",
+) {
+  Object.assign(state.networkRecovery, {
+    lastNetworkFailureAtMs: now - 1_000,
+    nextProbeAtMs: now,
+    consecutiveProbeFailures: 0,
+    lastErrorText: errorText,
+  });
 }
 
 describe("cron network recovery catch-up", () => {
@@ -267,18 +296,18 @@ describe("cron network recovery catch-up", () => {
           },
         },
       ],
-    }) as RecoveryTrackedState;
-    Object.assign(state.networkRecovery as Record<string, unknown>, {
-      lastNetworkFailureAtMs: now - 1_000,
-      nextProbeAtMs: now,
-      consecutiveProbeFailures: 0,
-      lastErrorText: "network connection error",
-    });
+    }) as ProbeRecoveryTrackedState;
+    markProbeFailureWindow(state, now);
 
-    await maybeProbeNetworkRecovery(state, {
+    await maybeRunNetworkRecoveryCatchup(state);
+
+    expect(state.deps.enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(state.deps.requestHeartbeatNow).not.toHaveBeenCalled();
+
+    await runProbeRecovery(state, {
       runFeishuProbe: vi.fn().mockResolvedValue(true),
       runLlmProbe: vi.fn().mockResolvedValue(true),
-    } as never);
+    });
 
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(
