@@ -240,6 +240,49 @@ describe("cron network recovery catch-up", () => {
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
   });
 
+  it("replays a critical network-failed job even when nextRunAtMs already moved to a future slot", async () => {
+    const now = Date.parse("2026-02-06T10:05:00.000Z");
+    const scheduledSlot = Date.parse("2026-02-06T10:01:00.000Z");
+    const futureNextRunAtMs = Date.parse("2026-02-06T10:11:00.000Z");
+    const store = await makeStorePath();
+    const state = createRunningCronServiceState({
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      jobs: [
+        {
+          ...createMissedCronSystemJob({
+            id: FOUNDER_OS_CRITICAL_JOB_ID,
+            name: "founder-os critical",
+            text: "replay failed founder critical future slot",
+            lastRunAtMs: scheduledSlot,
+            nextRunAtMs: futureNextRunAtMs,
+          }),
+          state: {
+            nextRunAtMs: futureNextRunAtMs,
+            lastRunAtMs: scheduledSlot,
+            lastStatus: "error",
+            lastError: "network connection error",
+          },
+        },
+      ],
+    }) as RecoveryTrackedState;
+    state.networkRecovery = {
+      lastNetworkFailureAtMs: now - 60_000,
+      lastStableSuccessAtMs: now - 60_000,
+      lastErrorText: "network connection error",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
+
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(
+      "replay failed founder critical future slot",
+      expect.objectContaining({ agentId: undefined }),
+    );
+    expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
+  });
+
   it("triggers recovery catch-up only once per stable recovery window", async () => {
     let now = Date.parse("2026-02-06T10:05:00.000Z");
     const store = await makeStorePath();
