@@ -35,6 +35,9 @@ type RecoveryTrackedState = ReturnType<typeof createRunningCronServiceState> & {
     lastNetworkFailureAtMs?: number;
     lastStableSuccessAtMs?: number;
     lastRecoveryCatchupTriggeredAtMs?: number;
+    lastFeishuProbeOkAtMs?: number;
+    lastLlmProbeOkAtMs?: number;
+    nextProbeAtMs?: number;
     lastErrorText?: string;
   };
 };
@@ -110,6 +113,29 @@ function markProbeFailureWindow(
   });
 }
 
+function markProbeConfirmedRecovery(
+  state: RecoveryTrackedState,
+  params: {
+    lastFailureAtMs: number;
+    probeOkAtMs?: number;
+    lastStableSuccessAtMs?: number;
+    nextProbeAtMs?: number;
+    lastErrorText?: string;
+    lastRecoveryCatchupTriggeredAtMs?: number;
+  },
+) {
+  const probeOkAtMs = params.probeOkAtMs ?? params.lastFailureAtMs;
+  Object.assign(state.networkRecovery, {
+    lastNetworkFailureAtMs: params.lastFailureAtMs,
+    lastStableSuccessAtMs: params.lastStableSuccessAtMs,
+    lastRecoveryCatchupTriggeredAtMs: params.lastRecoveryCatchupTriggeredAtMs,
+    lastFeishuProbeOkAtMs: probeOkAtMs,
+    lastLlmProbeOkAtMs: probeOkAtMs,
+    nextProbeAtMs: params.nextProbeAtMs,
+    lastErrorText: params.lastErrorText ?? "network error",
+  });
+}
+
 describe("cron network recovery catch-up", () => {
   it("classifies ENOTFOUND and normalized network errors as recoverable", () => {
     expect(isNetworkRecoverableCronError("getaddrinfo ENOTFOUND api.example.com")).toBe(true);
@@ -151,7 +177,7 @@ describe("cron network recovery catch-up", () => {
     expect(state.deps.requestHeartbeatNow).not.toHaveBeenCalled();
   });
 
-  it("replays only Founder OS critical jobs after the stable recovery window", async () => {
+  it("replays only Founder OS critical jobs after probe-confirmed recovery", async () => {
     const now = Date.parse("2026-02-06T10:05:00.000Z");
     const store = await makeStorePath();
     const state = createRunningCronServiceState({
@@ -173,11 +199,11 @@ describe("cron network recovery catch-up", () => {
         }),
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 60_000,
       lastStableSuccessAtMs: now - 60_000,
       lastErrorText: "getaddrinfo ENOTFOUND api.example.com",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
@@ -189,7 +215,7 @@ describe("cron network recovery catch-up", () => {
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
   });
 
-  it("replays all Founder OS critical jobs without restart staggering after stable recovery", async () => {
+  it("replays all Founder OS critical jobs without restart staggering after probe-confirmed recovery", async () => {
     const now = Date.parse("2026-02-06T10:05:00.000Z");
     const store = await makeStorePath();
     const state = createRunningCronServiceState({
@@ -206,11 +232,10 @@ describe("cron network recovery catch-up", () => {
       ),
     }) as RecoveryTrackedState;
     state.deps.maxMissedJobsPerRestart = 1;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 60_000,
       lastStableSuccessAtMs: now - 60_000,
-      lastErrorText: "network error",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
@@ -254,11 +279,11 @@ describe("cron network recovery catch-up", () => {
         },
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 60_000,
       lastStableSuccessAtMs: now - 60_000,
       lastErrorText: "getaddrinfo ENOTFOUND api.example.com",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
@@ -317,7 +342,7 @@ describe("cron network recovery catch-up", () => {
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
   });
 
-  it("triggers recovery catch-up only once per stable recovery window", async () => {
+  it("triggers recovery catch-up only once per probe-confirmed recovery window", async () => {
     let now = Date.parse("2026-02-06T10:05:00.000Z");
     const store = await makeStorePath();
     const state = createRunningCronServiceState({
@@ -333,11 +358,10 @@ describe("cron network recovery catch-up", () => {
         }),
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 60_000,
       lastStableSuccessAtMs: now - 60_000,
-      lastErrorText: "network error",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
@@ -349,7 +373,7 @@ describe("cron network recovery catch-up", () => {
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
   });
 
-  it("fires recovery after 60 seconds even when no later success is recorded", async () => {
+  it("fires recovery after probe-confirmed success even when no later successful job is recorded", async () => {
     const now = Date.parse("2026-02-06T10:05:00.000Z");
     const store = await makeStorePath();
     const state = createRunningCronServiceState({
@@ -365,11 +389,10 @@ describe("cron network recovery catch-up", () => {
         }),
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 60_000,
       lastStableSuccessAtMs: undefined,
-      lastErrorText: "network error",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
@@ -406,11 +429,10 @@ describe("cron network recovery catch-up", () => {
         },
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: lastFailure,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: lastFailure,
       lastStableSuccessAtMs: lastFailure,
-      lastErrorText: "network error",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
@@ -448,11 +470,12 @@ describe("cron network recovery catch-up", () => {
       jobs,
     }) as RecoveryTrackedState;
     state.running = false;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: baseNow - 120_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: baseNow - 120_000,
+      probeOkAtMs: baseNow - 60_000,
       lastStableSuccessAtMs: baseNow - 60_000,
-      lastErrorText: "network error",
-    };
+      nextProbeAtMs: baseNow + 60_000,
+    });
     state.deps.enqueueSystemEvent = vi.fn((text: string) => {
       if (text !== "replay after timer persistence") {
         return;
@@ -499,21 +522,19 @@ describe("cron network recovery catch-up", () => {
         }),
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 60_000,
       lastStableSuccessAtMs: now - 60_000,
-      lastErrorText: "network error",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
     now += 5 * 60_000;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 61_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 61_000,
       lastStableSuccessAtMs: now - 61_000,
       lastRecoveryCatchupTriggeredAtMs: now - 5 * 60_000,
-      lastErrorText: "network error",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
@@ -538,21 +559,20 @@ describe("cron network recovery catch-up", () => {
         }),
       ],
     }) as RecoveryTrackedState;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: initialFailure,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: initialFailure,
       lastStableSuccessAtMs: initialFailure,
-      lastErrorText: "network error",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 
     now += 3 * 60_000;
-    state.networkRecovery = {
-      lastNetworkFailureAtMs: now - 60_000,
+    markProbeConfirmedRecovery(state, {
+      lastFailureAtMs: now - 60_000,
       lastStableSuccessAtMs: now - 60_000,
       lastRecoveryCatchupTriggeredAtMs: initialFailure + 60_000,
       lastErrorText: "getaddrinfo ENOTFOUND api.example.com",
-    };
+    });
 
     await maybeRunNetworkRecoveryCatchup(state);
 

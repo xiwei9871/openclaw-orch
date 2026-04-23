@@ -1,9 +1,4 @@
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
-import {
-  buildModelAliasIndex,
-  resolveDefaultModelForAgent,
-  resolveModelRefFromString,
-} from "../../agents/model-selection.js";
 import { getRuntimeConfig } from "../../config/io.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
@@ -15,6 +10,15 @@ import {
 } from "../../tasks/task-executor.js";
 import { clearCronJobActive, markCronJobActive } from "../active-jobs.js";
 import { resolveCronDeliveryPlan } from "../delivery-plan.js";
+import { resolveCronModelSelection } from "../isolated-agent/model-selection.js";
+import { buildCronAgentDefaultsConfig } from "../isolated-agent/run-config.js";
+import {
+  normalizeAgentId,
+  resolveAgentConfig,
+  resolveDefaultAgentId,
+} from "../isolated-agent/run.runtime.js";
+import { resolveCronAgentSessionKey } from "../isolated-agent/session-key.js";
+import { resolveCronSession } from "../isolated-agent/session.js";
 import { sweepCronRunSessions } from "../session-reaper.js";
 import type {
   CronDeliveryStatus,
@@ -55,7 +59,6 @@ const DEFAULT_MISSED_JOB_STAGGER_MS = 5_000;
 const DEFAULT_MAX_MISSED_JOBS_PER_RESTART = 5;
 const DEFAULT_FAILURE_ALERT_AFTER = 2;
 const DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000; // 1 hour
-const NETWORK_RECOVERY_STABLE_WINDOW_MS = 60_000;
 const FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS = new Set([
   "c0ff4e45-9a3c-417e-a324-a95d65a16a28",
   "049a87d5-7cc5-4b65-a07f-a4ab47995ec4",
@@ -146,82 +149,121 @@ async function probeFeishuRecovery(): Promise<NetworkProbeResult> {
   }
 }
 
-function resolveFounderOsCriticalAgentId(state: CronServiceState, job: CronJob): string {
-  const explicit = typeof job.agentId === "string" ? job.agentId.trim() : "";
-  if (explicit) {
-    return explicit;
-  }
-  const fallback = typeof state.deps.defaultAgentId === "string" ? state.deps.defaultAgentId : "";
-  return fallback || DEFAULT_AGENT_ID;
+function sanitizeProbeIdComponent(input: string): string {
+  // Cron job ids are used as stable keys; keep them ASCII and avoid '/'.
+  return input.replace(/[^a-zA-Z0-9_.:-]+/g, "_").slice(0, 160);
 }
 
-function resolveFounderOsCriticalLlmProbeModelRefs(state: CronServiceState): {
-  provider: string;
-  model: string;
-  agentId: string;
-}[] {
-  if (!state.store) {
+async function resolveFounderOsCriticalLlmProbeTargets(params: {
+  state: CronServiceState;
+  cfg: ReturnType<typeof getRuntimeConfig>;
+}): Promise<
+  {
+    provider: string;
+    model: string;
+    agentId: string;
+    baseSessionKey: string;
+  }[]
+> {
+  const { state, cfg } = params;
+  if (!state.store?.jobs?.length) {
     return [];
   }
 
-  const cfg = getRuntimeConfig();
-  const deduped = new Map<string, { provider: string; model: string; agentId: string }>();
-  const aliasIndexByProvider = new Map<string, ReturnType<typeof buildModelAliasIndex>>();
+  const deduped = new Map<
+    string,
+    { provider: string; model: string; agentId: string; baseSessionKey: string }
+  >();
 
-  const getAliasIndex = (defaultProvider: string) => {
-    const existing = aliasIndexByProvider.get(defaultProvider);
-    if (existing) {
-      return existing;
-    }
-    const built = buildModelAliasIndex({
-      cfg,
-      defaultProvider,
-      allowPluginNormalization: true,
-    });
-    aliasIndexByProvider.set(defaultProvider, built);
-    return built;
-  };
+  const defaultAgentId = resolveDefaultAgentId(cfg) ?? DEFAULT_AGENT_ID;
 
   for (const job of state.store.jobs) {
     if (!FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS.has(job.id)) {
       continue;
     }
-
-    const agentId = resolveFounderOsCriticalAgentId(state, job);
-    const runtimeDefault = resolveDefaultModelForAgent({ cfg, agentId });
-    const defaultProvider = runtimeDefault.provider;
-    const aliasIndex = getAliasIndex(defaultProvider);
-
-    const modelSelections: string[] = [];
-    if (job.payload.kind === "agentTurn") {
-      if (typeof job.payload.model === "string" && job.payload.model.trim()) {
-        modelSelections.push(job.payload.model.trim());
-      }
-      if (Array.isArray(job.payload.fallbacks)) {
-        for (const fallback of job.payload.fallbacks) {
-          if (typeof fallback === "string" && fallback.trim()) {
-            modelSelections.push(fallback.trim());
-          }
-        }
-      }
-    }
-    if (modelSelections.length === 0) {
-      modelSelections.push(`${runtimeDefault.provider}/${runtimeDefault.model}`);
+    if (job.payload.kind !== "agentTurn") {
+      continue;
     }
 
-    for (const raw of modelSelections) {
-      const resolved = resolveModelRefFromString({
-        raw,
-        defaultProvider,
-        aliasIndex,
-        allowPluginNormalization: true,
+    const baseSessionKey = (job.sessionKey?.trim() || `cron:${job.id}`).trim();
+    const requestedAgentIdRaw =
+      typeof job.agentId === "string" && job.agentId.trim() ? job.agentId.trim() : undefined;
+    const normalizedRequested = requestedAgentIdRaw
+      ? normalizeAgentId(requestedAgentIdRaw)
+      : undefined;
+    const agentId = normalizedRequested ?? defaultAgentId;
+    const agentConfigOverride = normalizedRequested
+      ? resolveAgentConfig(cfg, normalizedRequested)
+      : undefined;
+
+    const agentCfg = buildCronAgentDefaultsConfig({
+      defaults: cfg.agents?.defaults,
+      agentConfigOverride,
+    });
+    const cfgWithAgentDefaults = {
+      ...cfg,
+      agents: Object.assign({}, cfg.agents, { defaults: agentCfg }),
+    };
+
+    const agentSessionKey = resolveCronAgentSessionKey({
+      sessionKey: baseSessionKey,
+      agentId,
+      mainKey: cfg.session?.mainKey,
+      cfg,
+    });
+    const cronSession = resolveCronSession({
+      cfg,
+      sessionKey: agentSessionKey,
+      agentId,
+      nowMs: state.deps.nowMs(),
+      // LLM probes run as isolated cron jobs; session overrides still apply.
+      forceNew: true,
+    });
+
+    const resolveForPayload = async (payload: CronJob["payload"]) => {
+      return await resolveCronModelSelection({
+        cfg,
+        cfgWithAgentDefaults,
+        agentConfigOverride,
+        sessionEntry: cronSession.sessionEntry,
+        payload,
+        isGmailHook: false,
       });
-      if (!resolved) {
-        continue;
-      }
-      const key = `${resolved.ref.provider}/${resolved.ref.model}`;
+    };
+
+    // Primary: what this job would run today with its actual payload (includes session overrides).
+    const primaryResolved = await resolveForPayload(job.payload);
+    if (!primaryResolved.ok) {
+      throw new Error(primaryResolved.error);
+    }
+
+    const addTarget = (provider: string, model: string) => {
+      const key = `${agentId}|${baseSessionKey}|${provider}/${model}`;
       if (!deduped.has(key)) {
-        deduped.set(key, { provider: resolved.ref.provider, model: resolved.ref.model, agentId });
+        deduped.set(key, {
+          provider,
+          model,
+          agentId,
+          baseSessionKey,
+        });
+      }
+    };
+    addTarget(primaryResolved.provider, primaryResolved.model);
+
+    // Secondary: probe any configured fallbacks as additional provider/model combos.
+    if (Array.isArray(job.payload.fallbacks)) {
+      for (const fallback of job.payload.fallbacks) {
+        if (typeof fallback !== "string" || !fallback.trim()) {
+          continue;
+        }
+        const candidatePayload: CronJob["payload"] = {
+          ...job.payload,
+          model: fallback.trim(),
+        };
+        const resolvedFallback = await resolveForPayload(candidatePayload);
+        if (resolvedFallback.ok) {
+          addTarget(resolvedFallback.provider, resolvedFallback.model);
+        }
       }
     }
   }
@@ -234,11 +276,14 @@ function createLlmProbeJob(params: {
   agentId: string;
   provider: string;
   model: string;
+  baseSessionKey: string;
 }): CronJob {
   const modelRef = `${params.provider}/${params.model}`;
+  const safeKey = sanitizeProbeIdComponent(params.baseSessionKey);
+  const safeModel = sanitizeProbeIdComponent(modelRef);
   return {
-    id: `cron:network-recovery-probe:${modelRef}`,
-    name: `network recovery probe (${modelRef})`,
+    id: `cron:network-recovery-probe:${safeKey}:${safeModel}`,
+    name: `network recovery probe (${params.provider}/${params.model})`,
     enabled: true,
     createdAtMs: params.nowMs,
     updatedAtMs: params.nowMs,
@@ -246,6 +291,9 @@ function createLlmProbeJob(params: {
     sessionTarget: "isolated",
     wakeMode: "now",
     agentId: params.agentId,
+    // Preserve the same isolated-run identity as the real cron job so session
+    // auth/profile overrides are honored by the probe.
+    sessionKey: params.baseSessionKey,
     payload: {
       kind: "agentTurn",
       message: "Network probe: reply with OK.",
@@ -259,7 +307,21 @@ function createLlmProbeJob(params: {
 }
 
 async function probeLlmRecovery(state: CronServiceState): Promise<NetworkProbeResult> {
-  const refs = resolveFounderOsCriticalLlmProbeModelRefs(state);
+  let cfg: ReturnType<typeof getRuntimeConfig>;
+  try {
+    cfg = getRuntimeConfig();
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  }
+
+  let refs: { provider: string; model: string; agentId: string; baseSessionKey: string }[];
+  try {
+    // Intentionally reuse isolated-cron model/session resolution so probe targets match
+    // the real runtime path (including session auth/profile overrides).
+    refs = await resolveFounderOsCriticalLlmProbeTargets({ state, cfg });
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  }
   if (refs.length === 0) {
     return { ok: true };
   }
@@ -274,6 +336,7 @@ async function probeLlmRecovery(state: CronServiceState): Promise<NetworkProbeRe
         agentId: ref.agentId,
         provider: ref.provider,
         model: ref.model,
+        baseSessionKey: ref.baseSessionKey,
       });
       const res = await state.deps.runIsolatedAgentJob({
         job,
@@ -350,11 +413,7 @@ export async function maybeProbeNetworkRecovery(
 
   state.networkRecovery.probeBackoffMs = undefined;
   state.networkRecovery.nextProbeAtMs = undefined;
-  await runMissedJobs(state, {
-    criticalJobIds: FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS,
-    recoveryMode: "network-recovery",
-  });
-  state.networkRecovery.lastRecoveryCatchupTriggeredAtMs = state.deps.nowMs();
+  await maybeRunNetworkRecoveryCatchup(state);
 }
 
 type TimedCronRunOutcome = CronRunOutcome &
@@ -973,8 +1032,14 @@ export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): P
   if (typeof lastFailure !== "number") {
     return;
   }
-  const now = state.deps.nowMs();
-  if (now - lastFailure < NETWORK_RECOVERY_STABLE_WINDOW_MS) {
+  const lastFeishuProbeOkAtMs = state.networkRecovery.lastFeishuProbeOkAtMs;
+  const lastLlmProbeOkAtMs = state.networkRecovery.lastLlmProbeOkAtMs;
+  if (
+    typeof lastFeishuProbeOkAtMs !== "number" ||
+    typeof lastLlmProbeOkAtMs !== "number" ||
+    lastFeishuProbeOkAtMs < lastFailure ||
+    lastLlmProbeOkAtMs < lastFailure
+  ) {
     return;
   }
   if (
@@ -987,7 +1052,7 @@ export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): P
     criticalJobIds: FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS,
     recoveryMode: "network-recovery",
   });
-  writeNetworkRecoveryTimestamps(state, { lastCatchupTriggered: now });
+  writeNetworkRecoveryTimestamps(state, { lastCatchupTriggered: state.deps.nowMs() });
 }
 
 export function armTimer(state: CronServiceState) {
@@ -1185,6 +1250,7 @@ export async function onTimer(state: CronServiceState) {
       });
     }
 
+    await maybeProbeNetworkRecovery(state);
     await maybeRunNetworkRecoveryCatchup(state);
   } finally {
     // Piggyback session reaper on timer tick (self-throttled to every 5 min).
