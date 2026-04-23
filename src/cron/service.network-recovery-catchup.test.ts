@@ -12,9 +12,9 @@ const FOUNDER_OS_CRITICAL_JOB_ID = "c0ff4e45-9a3c-417e-a324-a95d65a16a28";
 
 type RecoveryTrackedState = ReturnType<typeof createRunningCronServiceState> & {
   networkRecovery: {
-    lastRecoverableErrorAtMs?: number;
-    stableSinceMs?: number;
-    lastCatchupAtMs?: number;
+    lastNetworkFailureAtMs?: number;
+    lastStableSuccessAtMs?: number;
+    lastRecoveryCatchupTriggeredAtMs?: number;
     lastErrorText?: string;
   };
 };
@@ -69,8 +69,8 @@ describe("cron network recovery catch-up", () => {
       ],
     }) as RecoveryTrackedState;
     state.networkRecovery = {
-      lastRecoverableErrorAtMs: now - 59_000,
-      stableSinceMs: now - 59_000,
+      lastNetworkFailureAtMs: now - 59_000,
+      lastStableSuccessAtMs: now - 59_000,
       lastErrorText: "network error",
     };
 
@@ -103,8 +103,8 @@ describe("cron network recovery catch-up", () => {
       ],
     }) as RecoveryTrackedState;
     state.networkRecovery = {
-      lastRecoverableErrorAtMs: now - 60_000,
-      stableSinceMs: now - 60_000,
+      lastNetworkFailureAtMs: now - 60_000,
+      lastStableSuccessAtMs: now - 60_000,
       lastErrorText: "getaddrinfo ENOTFOUND api.example.com",
     };
 
@@ -135,8 +135,8 @@ describe("cron network recovery catch-up", () => {
       ],
     }) as RecoveryTrackedState;
     state.networkRecovery = {
-      lastRecoverableErrorAtMs: now - 60_000,
-      stableSinceMs: now - 60_000,
+      lastNetworkFailureAtMs: now - 60_000,
+      lastStableSuccessAtMs: now - 60_000,
       lastErrorText: "network error",
     };
 
@@ -167,8 +167,8 @@ describe("cron network recovery catch-up", () => {
       ],
     }) as RecoveryTrackedState;
     state.networkRecovery = {
-      lastRecoverableErrorAtMs: now - 60_000,
-      stableSinceMs: now - 60_000,
+      lastNetworkFailureAtMs: now - 60_000,
+      lastStableSuccessAtMs: now - 60_000,
       lastErrorText: "network error",
     };
 
@@ -176,9 +176,9 @@ describe("cron network recovery catch-up", () => {
 
     now += 5 * 60_000;
     state.networkRecovery = {
-      lastRecoverableErrorAtMs: now - 61_000,
-      stableSinceMs: now - 61_000,
-      lastCatchupAtMs: now - 5 * 60_000,
+      lastNetworkFailureAtMs: now - 61_000,
+      lastStableSuccessAtMs: now - 61_000,
+      lastRecoveryCatchupTriggeredAtMs: now - 5 * 60_000,
       lastErrorText: "network error",
     };
 
