@@ -49,6 +49,23 @@ const DEFAULT_MISSED_JOB_STAGGER_MS = 5_000;
 const DEFAULT_MAX_MISSED_JOBS_PER_RESTART = 5;
 const DEFAULT_FAILURE_ALERT_AFTER = 2;
 const DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000; // 1 hour
+const NETWORK_RECOVERY_STABLE_WINDOW_MS = 60_000;
+const FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS = new Set([
+  "c0ff4e45-9a3c-417e-a324-a95d65a16a28",
+  "049a87d5-7cc5-4b65-a07f-a4ab47995ec4",
+  "07084743-7475-446e-8013-63fc2afa88bc",
+  "81380d51-2a99-4f03-a8ef-e57e35faeb26",
+]);
+
+const NETWORK_RECOVERY_PATTERNS = [
+  /network error/i,
+  /network connection error/i,
+  /\bENOTFOUND\b/i,
+  /\bECONNRESET\b/i,
+  /\bECONNREFUSED\b/i,
+  /\bETIMEDOUT\b/i,
+  /getaddrinfo/i,
+];
 
 type TimedCronRunOutcome = CronRunOutcome &
   CronRunTelemetry & {
@@ -249,6 +266,61 @@ function resolveRetryConfig(cronConfig?: CronConfig) {
         : DEFAULT_BACKOFF_SCHEDULE_MS.slice(0, 3),
     retryOn: Array.isArray(retry?.retryOn) && retry.retryOn.length > 0 ? retry.retryOn : undefined,
   };
+}
+
+export function isNetworkRecoverableCronError(error: string | undefined): boolean {
+  if (!error) {
+    return false;
+  }
+  return NETWORK_RECOVERY_PATTERNS.some((pattern) => pattern.test(error));
+}
+
+function readNetworkRecoveryTimestamps(state: CronServiceState): {
+  lastFailure?: number;
+  lastStableSuccess?: number;
+  lastCatchupTriggered?: number;
+} {
+  const recovery = (state.networkRecovery ??= {}) as NonNullable<
+    CronServiceState["networkRecovery"]
+  > & {
+    lastRecoverableErrorAtMs?: number;
+    stableSinceMs?: number;
+    lastCatchupAtMs?: number;
+  };
+  return {
+    lastFailure: recovery.lastNetworkFailureAtMs ?? recovery.lastRecoverableErrorAtMs,
+    lastStableSuccess: recovery.lastStableSuccessAtMs ?? recovery.stableSinceMs,
+    lastCatchupTriggered: recovery.lastRecoveryCatchupTriggeredAtMs ?? recovery.lastCatchupAtMs,
+  };
+}
+
+function writeNetworkRecoveryTimestamps(
+  state: CronServiceState,
+  updates: {
+    lastFailure?: number;
+    lastStableSuccess?: number;
+    lastCatchupTriggered?: number;
+  },
+): void {
+  const recovery = (state.networkRecovery ??= {}) as NonNullable<
+    CronServiceState["networkRecovery"]
+  > & {
+    lastRecoverableErrorAtMs?: number;
+    stableSinceMs?: number;
+    lastCatchupAtMs?: number;
+  };
+  if ("lastFailure" in updates) {
+    recovery.lastNetworkFailureAtMs = updates.lastFailure;
+    recovery.lastRecoverableErrorAtMs = updates.lastFailure;
+  }
+  if ("lastStableSuccess" in updates) {
+    recovery.lastStableSuccessAtMs = updates.lastStableSuccess;
+    recovery.stableSinceMs = updates.lastStableSuccess;
+  }
+  if ("lastCatchupTriggered" in updates) {
+    recovery.lastRecoveryCatchupTriggeredAtMs = updates.lastCatchupTriggered;
+    recovery.lastCatchupAtMs = updates.lastCatchupTriggered;
+  }
 }
 
 function resolveDeliveryStatus(params: { job: CronJob; delivered?: boolean }): CronDeliveryStatus {
@@ -585,6 +657,7 @@ function applyOutcomeToStoredJob(state: CronServiceState, result: TimedCronRunOu
     startedAt: result.startedAt,
     endedAt: result.endedAt,
   });
+  recordNetworkRecoverySignal(state, result);
 
   emitJobFinished(state, job, result, result.startedAt);
 
@@ -592,6 +665,54 @@ function applyOutcomeToStoredJob(state: CronServiceState, result: TimedCronRunOu
     store.jobs = jobs.filter((entry) => entry.id !== job.id);
     emit(state, { jobId: job.id, action: "removed" });
   }
+}
+
+function recordNetworkRecoverySignal(
+  state: CronServiceState,
+  result: Pick<TimedCronRunOutcome, "jobId" | "status" | "error" | "endedAt">,
+): void {
+  if (!FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS.has(result.jobId)) {
+    return;
+  }
+  if (result.status === "error" && isNetworkRecoverableCronError(result.error)) {
+    writeNetworkRecoveryTimestamps(state, {
+      lastFailure: result.endedAt,
+      lastStableSuccess: undefined,
+      lastCatchupTriggered: undefined,
+    });
+    return;
+  }
+  if (result.status === "ok") {
+    writeNetworkRecoveryTimestamps(state, { lastStableSuccess: result.endedAt });
+  }
+}
+
+export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): Promise<void> {
+  const recovery = readNetworkRecoveryTimestamps(state);
+  const lastFailure = recovery.lastFailure;
+  const lastStableSuccess = recovery.lastStableSuccess;
+  if (typeof lastFailure !== "number" || typeof lastStableSuccess !== "number") {
+    return;
+  }
+  if (lastStableSuccess < lastFailure) {
+    return;
+  }
+  const now = state.deps.nowMs();
+  if (now - lastFailure < NETWORK_RECOVERY_STABLE_WINDOW_MS) {
+    return;
+  }
+  if (
+    typeof recovery.lastCatchupTriggered === "number" &&
+    recovery.lastCatchupTriggered >= lastFailure
+  ) {
+    return;
+  }
+  await runMissedJobs(state, {
+    skipJobIds: undefined,
+    criticalJobIds: FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS,
+    recoveryMode: "network-recovery",
+  } as never);
+  writeNetworkRecoveryTimestamps(state, { lastCatchupTriggered: now });
 }
 
 export function armTimer(state: CronServiceState) {
