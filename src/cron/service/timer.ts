@@ -1,4 +1,10 @@
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
+import {
+  buildModelAliasIndex,
+  resolveDefaultModelForAgent,
+  resolveModelRefFromString,
+} from "../../agents/model-selection.js";
+import { getRuntimeConfig } from "../../config/io.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
 import { DEFAULT_AGENT_ID } from "../../routing/session-key.js";
@@ -66,6 +72,290 @@ const NETWORK_RECOVERY_PATTERNS = [
   /\bETIMEDOUT\b/i,
   /getaddrinfo/i,
 ];
+
+export function resolveNextNetworkProbeDelayMs(previousDelayMs?: number): number {
+  if (previousDelayMs === undefined) {
+    return 15_000;
+  }
+  if (previousDelayMs < 30_000) {
+    return 30_000;
+  }
+  return 60_000;
+}
+
+function shouldRunNetworkProbe(state: CronServiceState, nowMs: number): boolean {
+  const recovery = state.networkRecovery;
+  if (typeof recovery.lastNetworkFailureAtMs !== "number") {
+    return false;
+  }
+  if (
+    typeof recovery.lastRecoveryCatchupTriggeredAtMs === "number" &&
+    recovery.lastRecoveryCatchupTriggeredAtMs >= recovery.lastNetworkFailureAtMs
+  ) {
+    return false;
+  }
+  return typeof recovery.nextProbeAtMs !== "number" || nowMs >= recovery.nextProbeAtMs;
+}
+
+type NetworkProbeResult = { ok: true } | { ok: false; error: string };
+
+function normalizeProbeResult(input: unknown): NetworkProbeResult {
+  if (input === true) {
+    return { ok: true };
+  }
+  if (input === false) {
+    return { ok: false, error: "probe failed" };
+  }
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    "ok" in input &&
+    (input as { ok?: unknown }).ok === true
+  ) {
+    return { ok: true };
+  }
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    "ok" in input &&
+    (input as { ok?: unknown }).ok === false
+  ) {
+    const error = (input as { error?: unknown }).error;
+    return { ok: false, error: typeof error === "string" && error.trim() ? error : "probe failed" };
+  }
+  return { ok: false, error: "probe failed" };
+}
+
+async function probeFeishuRecovery(): Promise<NetworkProbeResult> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(timeoutErrorMessage()), 7_500);
+  try {
+    const response = await fetch("https://open.feishu.cn/", {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (response.status >= 200 && response.status < 500) {
+      return { ok: true };
+    }
+    return { ok: false, error: `HTTP ${response.status}` };
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function resolveFounderOsCriticalAgentId(state: CronServiceState, job: CronJob): string {
+  const explicit = typeof job.agentId === "string" ? job.agentId.trim() : "";
+  if (explicit) {
+    return explicit;
+  }
+  const fallback = typeof state.deps.defaultAgentId === "string" ? state.deps.defaultAgentId : "";
+  return fallback || DEFAULT_AGENT_ID;
+}
+
+function resolveFounderOsCriticalLlmProbeModelRefs(state: CronServiceState): {
+  provider: string;
+  model: string;
+  agentId: string;
+}[] {
+  if (!state.store) {
+    return [];
+  }
+
+  const cfg = getRuntimeConfig();
+  const deduped = new Map<string, { provider: string; model: string; agentId: string }>();
+  const aliasIndexByProvider = new Map<string, ReturnType<typeof buildModelAliasIndex>>();
+
+  const getAliasIndex = (defaultProvider: string) => {
+    const existing = aliasIndexByProvider.get(defaultProvider);
+    if (existing) {
+      return existing;
+    }
+    const built = buildModelAliasIndex({
+      cfg,
+      defaultProvider,
+      allowPluginNormalization: true,
+    });
+    aliasIndexByProvider.set(defaultProvider, built);
+    return built;
+  };
+
+  for (const job of state.store.jobs) {
+    if (!FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS.has(job.id)) {
+      continue;
+    }
+
+    const agentId = resolveFounderOsCriticalAgentId(state, job);
+    const runtimeDefault = resolveDefaultModelForAgent({ cfg, agentId });
+    const defaultProvider = runtimeDefault.provider;
+    const aliasIndex = getAliasIndex(defaultProvider);
+
+    const modelSelections: string[] = [];
+    if (job.payload.kind === "agentTurn") {
+      if (typeof job.payload.model === "string" && job.payload.model.trim()) {
+        modelSelections.push(job.payload.model.trim());
+      }
+      if (Array.isArray(job.payload.fallbacks)) {
+        for (const fallback of job.payload.fallbacks) {
+          if (typeof fallback === "string" && fallback.trim()) {
+            modelSelections.push(fallback.trim());
+          }
+        }
+      }
+    }
+    if (modelSelections.length === 0) {
+      modelSelections.push(`${runtimeDefault.provider}/${runtimeDefault.model}`);
+    }
+
+    for (const raw of modelSelections) {
+      const resolved = resolveModelRefFromString({
+        raw,
+        defaultProvider,
+        aliasIndex,
+        allowPluginNormalization: true,
+      });
+      if (!resolved) {
+        continue;
+      }
+      const key = `${resolved.ref.provider}/${resolved.ref.model}`;
+      if (!deduped.has(key)) {
+        deduped.set(key, { provider: resolved.ref.provider, model: resolved.ref.model, agentId });
+      }
+    }
+  }
+
+  return [...deduped.values()];
+}
+
+function createLlmProbeJob(params: {
+  nowMs: number;
+  agentId: string;
+  provider: string;
+  model: string;
+}): CronJob {
+  const modelRef = `${params.provider}/${params.model}`;
+  return {
+    id: `cron:network-recovery-probe:${modelRef}`,
+    name: `network recovery probe (${modelRef})`,
+    enabled: true,
+    createdAtMs: params.nowMs,
+    updatedAtMs: params.nowMs,
+    schedule: { kind: "at", at: new Date(params.nowMs).toISOString() },
+    sessionTarget: "isolated",
+    wakeMode: "now",
+    agentId: params.agentId,
+    payload: {
+      kind: "agentTurn",
+      message: "Network probe: reply with OK.",
+      model: modelRef,
+      lightContext: true,
+      toolsAllow: [],
+      timeoutSeconds: 15,
+    },
+    state: { nextRunAtMs: params.nowMs },
+  };
+}
+
+async function probeLlmRecovery(state: CronServiceState): Promise<NetworkProbeResult> {
+  const refs = resolveFounderOsCriticalLlmProbeModelRefs(state);
+  if (refs.length === 0) {
+    return { ok: true };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(timeoutErrorMessage()), 20_000);
+  try {
+    for (const ref of refs) {
+      const nowMs = state.deps.nowMs();
+      const job = createLlmProbeJob({
+        nowMs,
+        agentId: ref.agentId,
+        provider: ref.provider,
+        model: ref.model,
+      });
+      const res = await state.deps.runIsolatedAgentJob({
+        job,
+        message: job.payload.kind === "agentTurn" ? job.payload.message : "Network probe",
+        abortSignal: controller.signal,
+      });
+      if (res.status !== "ok") {
+        return {
+          ok: false,
+          error: typeof res.error === "string" && res.error.trim() ? res.error : "llm probe failed",
+        };
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export async function maybeProbeNetworkRecovery(
+  state: CronServiceState,
+  overrides?: {
+    runFeishuProbe?: () => Promise<boolean | NetworkProbeResult>;
+    runLlmProbe?: () => Promise<boolean | NetworkProbeResult>;
+  },
+): Promise<void> {
+  const nowMs = state.deps.nowMs();
+  if (!shouldRunNetworkProbe(state, nowMs)) {
+    return;
+  }
+
+  const currentWindowFailureAtMs = state.networkRecovery.lastNetworkFailureAtMs;
+  if (typeof currentWindowFailureAtMs !== "number") {
+    return;
+  }
+  if (state.networkRecovery.lastProbeWindowFailureAtMs !== currentWindowFailureAtMs) {
+    state.networkRecovery.lastProbeWindowFailureAtMs = currentWindowFailureAtMs;
+    state.networkRecovery.probeBackoffMs = undefined;
+    state.networkRecovery.nextProbeAtMs = nowMs;
+    state.networkRecovery.lastFeishuProbeOkAtMs = undefined;
+    state.networkRecovery.lastLlmProbeOkAtMs = undefined;
+    state.networkRecovery.lastFeishuProbeError = undefined;
+    state.networkRecovery.lastLlmProbeError = undefined;
+  }
+
+  const feishu = overrides?.runFeishuProbe
+    ? normalizeProbeResult(await overrides.runFeishuProbe())
+    : await probeFeishuRecovery();
+  if (feishu.ok) {
+    state.networkRecovery.lastFeishuProbeOkAtMs = nowMs;
+    state.networkRecovery.lastFeishuProbeError = undefined;
+  } else {
+    state.networkRecovery.lastFeishuProbeError = feishu.error;
+  }
+
+  const llm = overrides?.runLlmProbe
+    ? normalizeProbeResult(await overrides.runLlmProbe())
+    : await probeLlmRecovery(state);
+  if (llm.ok) {
+    state.networkRecovery.lastLlmProbeOkAtMs = nowMs;
+    state.networkRecovery.lastLlmProbeError = undefined;
+  } else {
+    state.networkRecovery.lastLlmProbeError = llm.error;
+  }
+
+  if (!feishu.ok || !llm.ok) {
+    const nextDelayMs = resolveNextNetworkProbeDelayMs(state.networkRecovery.probeBackoffMs);
+    state.networkRecovery.probeBackoffMs = nextDelayMs;
+    state.networkRecovery.nextProbeAtMs = nowMs + nextDelayMs;
+    return;
+  }
+
+  state.networkRecovery.probeBackoffMs = undefined;
+  state.networkRecovery.nextProbeAtMs = undefined;
+  await runMissedJobs(state, {
+    criticalJobIds: FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS,
+    recoveryMode: "network-recovery",
+  });
+  state.networkRecovery.lastRecoveryCatchupTriggeredAtMs = state.deps.nowMs();
+}
 
 type TimedCronRunOutcome = CronRunOutcome &
   CronRunTelemetry & {

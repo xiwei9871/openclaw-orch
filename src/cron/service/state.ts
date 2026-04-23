@@ -122,6 +122,13 @@ export type CronNetworkRecoveryState = {
   lastNetworkFailureAtMs?: number;
   lastStableSuccessAtMs?: number;
   lastRecoveryCatchupTriggeredAtMs?: number;
+  probeBackoffMs?: number;
+  nextProbeAtMs?: number;
+  lastProbeWindowFailureAtMs?: number;
+  lastFeishuProbeOkAtMs?: number;
+  lastLlmProbeOkAtMs?: number;
+  lastFeishuProbeError?: string;
+  lastLlmProbeError?: string;
 };
 
 export type CronServiceState = {
