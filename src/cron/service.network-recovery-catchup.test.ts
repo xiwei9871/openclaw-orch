@@ -200,6 +200,46 @@ describe("cron network recovery catch-up", () => {
     );
   });
 
+  it("replays a critical job whose latest network failure already advanced nextRunAtMs", async () => {
+    const now = Date.parse("2026-02-06T10:05:00.000Z");
+    const store = await makeStorePath();
+    const state = createRunningCronServiceState({
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      jobs: [
+        {
+          ...createOverdueSystemJob({
+            id: FOUNDER_OS_CRITICAL_JOB_ID,
+            name: "founder-os critical",
+            text: "replay failed founder critical",
+            nextRunAtMs: now + 6 * 60_000,
+          }),
+          state: {
+            nextRunAtMs: now + 6 * 60_000,
+            lastRunAtMs: now - 30_000,
+            lastStatus: "error",
+            lastError: "getaddrinfo ENOTFOUND api.example.com",
+          },
+        },
+      ],
+    }) as RecoveryTrackedState;
+    state.networkRecovery = {
+      lastNetworkFailureAtMs: now - 60_000,
+      lastStableSuccessAtMs: now - 60_000,
+      lastErrorText: "getaddrinfo ENOTFOUND api.example.com",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
+
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(
+      "replay failed founder critical",
+      expect.objectContaining({ agentId: undefined }),
+    );
+    expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
+  });
+
   it("triggers recovery catch-up only once per stable recovery window", async () => {
     let now = Date.parse("2026-02-06T10:05:00.000Z");
     const store = await makeStorePath();
@@ -229,6 +269,38 @@ describe("cron network recovery catch-up", () => {
     await maybeRunNetworkRecoveryCatchup(state);
 
     expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires recovery after 60 seconds even when no later success is recorded", async () => {
+    const now = Date.parse("2026-02-06T10:05:00.000Z");
+    const store = await makeStorePath();
+    const state = createRunningCronServiceState({
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      jobs: [
+        createOverdueSystemJob({
+          id: FOUNDER_OS_CRITICAL_JOB_ID,
+          name: "founder-os critical",
+          text: "replay founder critical without later success",
+          nextRunAtMs: now - 5 * 60_000,
+        }),
+      ],
+    }) as RecoveryTrackedState;
+    state.networkRecovery = {
+      lastNetworkFailureAtMs: now - 60_000,
+      lastStableSuccessAtMs: undefined,
+      lastErrorText: "network error",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
+
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledWith(
+      "replay founder critical without later success",
+      expect.objectContaining({ agentId: undefined }),
+    );
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
   });
 

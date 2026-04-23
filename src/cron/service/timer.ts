@@ -680,15 +680,11 @@ function recordNetworkRecoverySignal(
 export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): Promise<void> {
   const recovery = readNetworkRecoveryTimestamps(state);
   const lastFailure = recovery.lastFailure;
-  const lastStableSuccess = recovery.lastStableSuccess;
-  if (typeof lastFailure !== "number" || typeof lastStableSuccess !== "number") {
-    return;
-  }
-  if (lastStableSuccess < lastFailure) {
+  if (typeof lastFailure !== "number") {
     return;
   }
   const now = state.deps.nowMs();
-  if (now - lastStableSuccess < NETWORK_RECOVERY_STABLE_WINDOW_MS) {
+  if (now - lastFailure < NETWORK_RECOVERY_STABLE_WINDOW_MS) {
     return;
   }
   if (
@@ -1077,27 +1073,24 @@ async function planStartupCatchup(
       skipJobIds: opts?.skipJobIds,
       skipAtIfAlreadyRan: true,
       allowCronMissedRunByLastRun: true,
-    }).filter((job) => {
-      if (opts?.criticalJobIds && !opts.criticalJobIds.has(job.id)) {
-        return false;
+    }).filter((job) => shouldIncludeCatchupMissedJob(state, job, opts));
+    const candidatesById = new Map<string, CronJob>(missed.map((job) => [job.id, job]));
+
+    if (opts?.recoveryMode === "network-recovery") {
+      for (const job of collectExplicitNetworkRecoveryCandidates(state, opts)) {
+        candidatesById.set(job.id, job);
       }
-      if (opts?.recoveryMode !== "network-recovery") {
-        return true;
-      }
-      return (
-        isNetworkRecoverableCronError(job.state.lastError) ||
-        (typeof state.networkRecovery.lastNetworkFailureAtMs === "number" &&
-          (job.state.lastRunAtMs ?? 0) <= state.networkRecovery.lastNetworkFailureAtMs)
-      );
-    });
-    if (missed.length === 0) {
+    }
+
+    const dedupedCandidates = [...candidatesById.values()];
+    if (dedupedCandidates.length === 0) {
       return { candidates: [], deferredJobIds: [] };
     }
     const maxImmediate =
       opts?.recoveryMode === "network-recovery"
-        ? missed.length
+        ? dedupedCandidates.length
         : Math.max(0, state.deps.maxMissedJobsPerRestart ?? DEFAULT_MAX_MISSED_JOBS_PER_RESTART);
-    const sorted = missed.toSorted(
+    const sorted = dedupedCandidates.toSorted(
       (a, b) => (a.state.nextRunAtMs ?? 0) - (b.state.nextRunAtMs ?? 0),
     );
     const startupCandidates = sorted.slice(0, maxImmediate);
@@ -1107,7 +1100,7 @@ async function planStartupCatchup(
         {
           immediateCount: startupCandidates.length,
           deferredCount: deferred.length,
-          totalMissed: missed.length,
+          totalMissed: dedupedCandidates.length,
         },
         "cron: staggering missed jobs to prevent gateway overload",
       );
@@ -1130,6 +1123,45 @@ async function planStartupCatchup(
       candidates: startupCandidates.map((job) => ({ jobId: job.id, job })),
       deferredJobIds: deferred.map((job) => job.id),
     };
+  });
+}
+
+function shouldIncludeCatchupMissedJob(
+  state: CronServiceState,
+  job: CronJob,
+  opts?: CatchupOptions,
+): boolean {
+  if (opts?.criticalJobIds && !opts.criticalJobIds.has(job.id)) {
+    return false;
+  }
+  if (opts?.recoveryMode !== "network-recovery") {
+    return true;
+  }
+  return (
+    isNetworkRecoverableCronError(job.state.lastError) ||
+    (typeof state.networkRecovery.lastNetworkFailureAtMs === "number" &&
+      (job.state.lastRunAtMs ?? 0) <= state.networkRecovery.lastNetworkFailureAtMs)
+  );
+}
+
+function collectExplicitNetworkRecoveryCandidates(
+  state: CronServiceState,
+  opts?: CatchupOptions,
+): CronJob[] {
+  if (!state.store) {
+    return [];
+  }
+  return state.store.jobs.filter((job) => {
+    if (opts?.criticalJobIds && !opts.criticalJobIds.has(job.id)) {
+      return false;
+    }
+    if (opts?.skipJobIds?.has(job.id)) {
+      return false;
+    }
+    if (!isJobEnabled(job) || typeof job.state.runningAtMs === "number") {
+      return false;
+    }
+    return job.state.lastStatus === "error" && isNetworkRecoverableCronError(job.state.lastError);
   });
 }
 
