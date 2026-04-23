@@ -680,7 +680,7 @@ export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): P
     return;
   }
   const now = state.deps.nowMs();
-  if (now - lastFailure < NETWORK_RECOVERY_STABLE_WINDOW_MS) {
+  if (now - lastStableSuccess < NETWORK_RECOVERY_STABLE_WINDOW_MS) {
     return;
   }
   if (
@@ -689,11 +689,7 @@ export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): P
   ) {
     return;
   }
-  await runMissedJobs(state, {
-    skipJobIds: undefined,
-    criticalJobIds: FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS,
-    recoveryMode: "network-recovery",
-  } as never);
+  await runMissedJobs(state);
   writeNetworkRecoveryTimestamps(state, { lastCatchupTriggered: now });
 }
 
