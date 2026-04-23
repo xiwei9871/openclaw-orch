@@ -1,6 +1,15 @@
-import { describe, expect, it } from "vitest";
-import { createRunningCronServiceState, setupCronServiceSuite } from "./service.test-harness.js";
-import { isNetworkRecoverableCronError, maybeRunNetworkRecoveryCatchup } from "./service/timer.js";
+import fs from "node:fs";
+import { describe, expect, it, vi } from "vitest";
+import {
+  createRunningCronServiceState,
+  setupCronServiceSuite,
+  writeCronStoreSnapshot,
+} from "./service.test-harness.js";
+import {
+  isNetworkRecoverableCronError,
+  maybeRunNetworkRecoveryCatchup,
+  onTimer,
+} from "./service/timer.js";
 import type { CronJob } from "./types.js";
 
 const { logger: noopLogger, makeStorePath } = setupCronServiceSuite({
@@ -9,6 +18,12 @@ const { logger: noopLogger, makeStorePath } = setupCronServiceSuite({
 });
 
 const FOUNDER_OS_CRITICAL_JOB_ID = "c0ff4e45-9a3c-417e-a324-a95d65a16a28";
+const FOUNDER_OS_CRITICAL_JOB_IDS = [
+  "c0ff4e45-9a3c-417e-a324-a95d65a16a28",
+  "049a87d5-7cc5-4b65-a07f-a4ab47995ec4",
+  "07084743-7475-446e-8013-63fc2afa88bc",
+  "81380d51-2a99-4f03-a8ef-e57e35faeb26",
+];
 
 type RecoveryTrackedState = ReturnType<typeof createRunningCronServiceState> & {
   networkRecovery: {
@@ -36,6 +51,32 @@ function createOverdueSystemJob(params: {
     wakeMode: "next-heartbeat",
     payload: { kind: "systemEvent", text: params.text },
     state: { nextRunAtMs: params.nextRunAtMs },
+  };
+}
+
+function createMissedCronSystemJob(params: {
+  id: string;
+  name?: string;
+  text: string;
+  nextRunAtMs: number;
+  lastRunAtMs: number;
+  expr?: string;
+}): CronJob {
+  return {
+    id: params.id,
+    name: params.name ?? params.id,
+    enabled: true,
+    createdAtMs: params.lastRunAtMs - 60_000,
+    updatedAtMs: params.lastRunAtMs,
+    schedule: { kind: "cron", expr: params.expr ?? "1,11,21,31,41,51 10 * * *", tz: "UTC" },
+    sessionTarget: "main",
+    wakeMode: "next-heartbeat",
+    payload: { kind: "systemEvent", text: params.text },
+    state: {
+      nextRunAtMs: params.nextRunAtMs,
+      lastRunAtMs: params.lastRunAtMs,
+      lastStatus: "ok",
+    },
   };
 }
 
@@ -118,6 +159,47 @@ describe("cron network recovery catch-up", () => {
     expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(1);
   });
 
+  it("replays all Founder OS critical jobs without restart staggering after stable recovery", async () => {
+    const now = Date.parse("2026-02-06T10:05:00.000Z");
+    const store = await makeStorePath();
+    const state = createRunningCronServiceState({
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => now,
+      jobs: FOUNDER_OS_CRITICAL_JOB_IDS.map((id, index) =>
+        createOverdueSystemJob({
+          id,
+          name: `founder-os critical ${index + 1}`,
+          text: `replay founder critical ${index + 1}`,
+          nextRunAtMs: now - (index + 1) * 60_000,
+        }),
+      ),
+    }) as RecoveryTrackedState;
+    state.deps.maxMissedJobsPerRestart = 1;
+    state.networkRecovery = {
+      lastNetworkFailureAtMs: now - 60_000,
+      lastStableSuccessAtMs: now - 60_000,
+      lastErrorText: "network error",
+    };
+
+    await maybeRunNetworkRecoveryCatchup(state);
+
+    expect(state.deps.enqueueSystemEvent).toHaveBeenCalledTimes(4);
+    expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(4);
+    expect(
+      noopLogger.info.mock.calls.some(
+        ([, message]) => message === "cron: staggering missed jobs to prevent gateway overload",
+      ),
+    ).toBe(false);
+    expect(noopLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        count: 4,
+        jobIds: expect.arrayContaining(FOUNDER_OS_CRITICAL_JOB_IDS),
+      }),
+      "cron: running missed jobs after network recovery",
+    );
+  });
+
   it("triggers recovery catch-up only once per stable recovery window", async () => {
     let now = Date.parse("2026-02-06T10:05:00.000Z");
     const store = await makeStorePath();
@@ -185,6 +267,71 @@ describe("cron network recovery catch-up", () => {
 
     expect(state.deps.enqueueSystemEvent).not.toHaveBeenCalled();
     expect(state.deps.requestHeartbeatNow).not.toHaveBeenCalled();
+  });
+
+  it("runs network recovery catch-up from the timer loop after persisting normal results", async () => {
+    const baseNow = Date.parse("2026-02-06T10:02:00.000Z");
+    const dueJobId = "timer-due-job";
+    const replayJobId = FOUNDER_OS_CRITICAL_JOB_IDS[0];
+    const store = await makeStorePath();
+    const jobs = [
+      createOverdueSystemJob({
+        id: dueJobId,
+        name: "timer due job",
+        text: "record timer result",
+        nextRunAtMs: baseNow - 60_000,
+      }),
+      createMissedCronSystemJob({
+        id: replayJobId,
+        name: "founder-os replay candidate",
+        text: "replay after timer persistence",
+        nextRunAtMs: Date.parse("2026-02-06T10:11:00.000Z"),
+        lastRunAtMs: Date.parse("2026-02-06T09:51:00.000Z"),
+      }),
+    ];
+    await writeCronStoreSnapshot({ storePath: store.storePath, jobs });
+
+    const persistedSnapshots: Array<{ lastStatus?: string; lastRunAtMs?: number }> = [];
+    const state = createRunningCronServiceState({
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => baseNow,
+      jobs,
+    }) as RecoveryTrackedState;
+    state.running = false;
+    state.networkRecovery = {
+      lastNetworkFailureAtMs: baseNow - 120_000,
+      lastStableSuccessAtMs: baseNow - 60_000,
+      lastErrorText: "network error",
+    };
+    state.deps.enqueueSystemEvent = vi.fn((text: string) => {
+      if (text !== "replay after timer persistence") {
+        return;
+      }
+      const persisted = JSON.parse(fs.readFileSync(store.storePath, "utf-8")) as {
+        jobs: CronJob[];
+      };
+      const dueJob = persisted.jobs.find((job) => job.id === dueJobId);
+      persistedSnapshots.push({
+        lastStatus: dueJob?.state.lastStatus,
+        lastRunAtMs: dueJob?.state.lastRunAtMs,
+      });
+    }) as typeof state.deps.enqueueSystemEvent;
+
+    await onTimer(state);
+
+    expect(state.deps.enqueueSystemEvent).toHaveBeenNthCalledWith(
+      1,
+      "record timer result",
+      expect.objectContaining({ agentId: undefined }),
+    );
+    expect(state.deps.enqueueSystemEvent).toHaveBeenNthCalledWith(
+      2,
+      "replay after timer persistence",
+      expect.objectContaining({ agentId: undefined }),
+    );
+    expect(state.deps.requestHeartbeatNow).toHaveBeenCalledTimes(2);
+    expect(persistedSnapshots).toEqual([{ lastStatus: "ok", lastRunAtMs: baseNow }]);
   });
 
   it("allows one catch-up per recovery window instead of becoming a permanent latch", async () => {

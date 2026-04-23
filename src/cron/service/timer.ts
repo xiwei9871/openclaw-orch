@@ -1066,10 +1066,6 @@ async function planStartupCatchup(
   state: CronServiceState,
   opts?: CatchupOptions,
 ): Promise<StartupCatchupPlan> {
-  const maxImmediate = Math.max(
-    0,
-    state.deps.maxMissedJobsPerRestart ?? DEFAULT_MAX_MISSED_JOBS_PER_RESTART,
-  );
   return locked(state, async () => {
     await ensureLoaded(state, { skipRecompute: true });
     if (!state.store) {
@@ -1097,6 +1093,10 @@ async function planStartupCatchup(
     if (missed.length === 0) {
       return { candidates: [], deferredJobIds: [] };
     }
+    const maxImmediate =
+      opts?.recoveryMode === "network-recovery"
+        ? missed.length
+        : Math.max(0, state.deps.maxMissedJobsPerRestart ?? DEFAULT_MAX_MISSED_JOBS_PER_RESTART);
     const sorted = missed.toSorted(
       (a, b) => (a.state.nextRunAtMs ?? 0) - (b.state.nextRunAtMs ?? 0),
     );
@@ -1113,9 +1113,11 @@ async function planStartupCatchup(
       );
     }
     if (startupCandidates.length > 0) {
+      const catchupReason =
+        opts?.recoveryMode === "network-recovery" ? "network recovery" : "restart";
       state.deps.log.info(
         { count: startupCandidates.length, jobIds: startupCandidates.map((j) => j.id) },
-        "cron: running missed jobs after restart",
+        `cron: running missed jobs after ${catchupReason}`,
       );
     }
     for (const job of startupCandidates) {
