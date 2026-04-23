@@ -280,17 +280,10 @@ function readNetworkRecoveryTimestamps(state: CronServiceState): {
   lastStableSuccess?: number;
   lastCatchupTriggered?: number;
 } {
-  const recovery = (state.networkRecovery ??= {}) as NonNullable<
-    CronServiceState["networkRecovery"]
-  > & {
-    lastRecoverableErrorAtMs?: number;
-    stableSinceMs?: number;
-    lastCatchupAtMs?: number;
-  };
   return {
-    lastFailure: recovery.lastNetworkFailureAtMs ?? recovery.lastRecoverableErrorAtMs,
-    lastStableSuccess: recovery.lastStableSuccessAtMs ?? recovery.stableSinceMs,
-    lastCatchupTriggered: recovery.lastRecoveryCatchupTriggeredAtMs ?? recovery.lastCatchupAtMs,
+    lastFailure: state.networkRecovery.lastNetworkFailureAtMs,
+    lastStableSuccess: state.networkRecovery.lastStableSuccessAtMs,
+    lastCatchupTriggered: state.networkRecovery.lastRecoveryCatchupTriggeredAtMs,
   };
 }
 
@@ -302,24 +295,14 @@ function writeNetworkRecoveryTimestamps(
     lastCatchupTriggered?: number;
   },
 ): void {
-  const recovery = (state.networkRecovery ??= {}) as NonNullable<
-    CronServiceState["networkRecovery"]
-  > & {
-    lastRecoverableErrorAtMs?: number;
-    stableSinceMs?: number;
-    lastCatchupAtMs?: number;
-  };
   if ("lastFailure" in updates) {
-    recovery.lastNetworkFailureAtMs = updates.lastFailure;
-    recovery.lastRecoverableErrorAtMs = updates.lastFailure;
+    state.networkRecovery.lastNetworkFailureAtMs = updates.lastFailure;
   }
   if ("lastStableSuccess" in updates) {
-    recovery.lastStableSuccessAtMs = updates.lastStableSuccess;
-    recovery.stableSinceMs = updates.lastStableSuccess;
+    state.networkRecovery.lastStableSuccessAtMs = updates.lastStableSuccess;
   }
   if ("lastCatchupTriggered" in updates) {
-    recovery.lastRecoveryCatchupTriggeredAtMs = updates.lastCatchupTriggered;
-    recovery.lastCatchupAtMs = updates.lastCatchupTriggered;
+    state.networkRecovery.lastRecoveryCatchupTriggeredAtMs = updates.lastCatchupTriggered;
   }
 }
 
@@ -657,7 +640,6 @@ function applyOutcomeToStoredJob(state: CronServiceState, result: TimedCronRunOu
     startedAt: result.startedAt,
     endedAt: result.endedAt,
   });
-  recordNetworkRecoverySignal(state, result);
 
   emitJobFinished(state, job, result, result.startedAt);
 
@@ -897,6 +879,7 @@ export async function onTimer(state: CronServiceState) {
         await ensureLoaded(state, { forceReload: true, skipRecompute: true });
         for (const result of completedResults) {
           applyOutcomeToStoredJob(state, result);
+          recordNetworkRecoverySignal(state, result);
         }
 
         // Use maintenance-only recompute to avoid advancing past-due
@@ -1197,6 +1180,7 @@ async function applyStartupCatchupOutcomes(
 
     for (const result of outcomes) {
       applyOutcomeToStoredJob(state, result);
+      recordNetworkRecoverySignal(state, result);
     }
 
     if (plan.deferredJobIds.length > 0) {

@@ -133,7 +133,7 @@ export type CronServiceState = {
   warnedDisabled: boolean;
   storeLoadedAtMs: number | null;
   storeFileMtimeMs: number | null;
-  networkRecovery?: CronNetworkRecoveryState;
+  networkRecovery: CronNetworkRecoveryState;
 };
 
 export function createCronServiceState(deps: CronServiceDeps): CronServiceState {
