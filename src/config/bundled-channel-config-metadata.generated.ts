@@ -3142,6 +3142,10 @@ export const GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA = [
         enabled: {
           type: "boolean",
         },
+        appType: {
+          type: "string",
+          enum: ["custom", "self_build", "internal"],
+        },
         defaultAccount: {
           type: "string",
         },
@@ -3692,6 +3696,30 @@ export const GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA = [
           },
           additionalProperties: false,
         },
+        taskBoard: {
+          type: "object",
+          properties: {
+            enabled: {
+              type: "boolean",
+            },
+            accountId: {
+              type: "string",
+            },
+            appToken: {
+              type: "string",
+            },
+            tableId: {
+              type: "string",
+            },
+            summarySessionKey: {
+              type: "string",
+            },
+            summaryChatId: {
+              type: "string",
+            },
+          },
+          additionalProperties: false,
+        },
         accounts: {
           type: "object",
           propertyNames: {
@@ -3704,6 +3732,18 @@ export const GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA = [
                 type: "boolean",
               },
               name: {
+                type: "string",
+              },
+              botName: {
+                type: "string",
+              },
+              botRole: {
+                type: "string",
+              },
+              botDescription: {
+                type: "string",
+              },
+              botOpenId: {
                 type: "string",
               },
               appId: {

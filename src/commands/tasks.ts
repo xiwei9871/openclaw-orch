@@ -1,6 +1,17 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { loadConfig } from "../config/config.js";
 import { info } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
+import {
+  applyCronPathRepair,
+  buildTaskControlPlane,
+  buildTaskControlProjectionLayer,
+  buildTaskControlInventory,
+  buildCronPathRepairReport,
+  renderJarvisTaskHealthSummaryMarkdown,
+  writeTaskControlInventory,
+} from "../tasks/control-plane/index.js";
 import {
   cancelTaskById,
   getTaskById,
@@ -546,4 +557,213 @@ export async function tasksMaintenanceCommand(
   if (!opts.apply) {
     runtime.log("Dry run only. Re-run with `openclaw tasks maintenance --apply` to write changes.");
   }
+}
+
+export async function tasksControlCommand(
+  opts: {
+    json?: boolean;
+    timeZone?: string;
+    syncFeishu?: boolean;
+    feishuAccount?: string;
+    appToken?: string;
+    tableId?: string;
+    writeSummary?: string;
+    sendFeishuSummary?: boolean;
+    summaryTarget?: string;
+    summaryAccount?: string;
+    inventory?: boolean;
+    writeInventory?: string;
+    previewCronPathRepair?: boolean;
+    applyCronPathRepair?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  const model = buildTaskControlPlane();
+  const projectionLayer = buildTaskControlProjectionLayer(model, {
+    now: model.generatedAt,
+    timeZone: opts.timeZone,
+  });
+  const inventory =
+    opts.inventory || opts.writeInventory ? await buildTaskControlInventory() : undefined;
+  const cronPathRepair =
+    opts.previewCronPathRepair || opts.applyCronPathRepair
+      ? opts.applyCronPathRepair
+        ? await applyCronPathRepair()
+        : await buildCronPathRepairReport()
+      : undefined;
+  let summaryFilePath: string | undefined;
+  let inventoryFiles: Awaited<ReturnType<typeof writeTaskControlInventory>> | undefined;
+  let summaryDelivery:
+    | {
+        channel: "feishu";
+        accountId: string;
+        target: string;
+      }
+    | undefined;
+  let projectionSync:
+    | Awaited<
+        ReturnType<
+          typeof import("../tasks/control-plane/feishu-bitable.js").syncTaskControlProjectionToFeishu
+        >
+      >
+    | undefined;
+
+  if (opts.syncFeishu) {
+    if (!opts.appToken?.trim() || !opts.tableId?.trim()) {
+      runtime.error("--sync-feishu requires --app-token and --table-id");
+      runtime.exit(1);
+      return;
+    }
+    const { syncTaskControlProjectionToFeishu } =
+      await import("../tasks/control-plane/feishu-bitable.js");
+    projectionSync = await syncTaskControlProjectionToFeishu({
+      cfg: loadConfig(),
+      projection: projectionLayer.feishu,
+      target: {
+        appToken: opts.appToken.trim(),
+        tableId: opts.tableId.trim(),
+        accountId: opts.feishuAccount?.trim(),
+      },
+    });
+  }
+
+  if (opts.writeSummary?.trim()) {
+    const outputPath = path.resolve(opts.writeSummary.trim());
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(
+      outputPath,
+      renderJarvisTaskHealthSummaryMarkdown(projectionLayer.summary),
+      "utf8",
+    );
+    summaryFilePath = outputPath;
+  }
+
+  if (opts.writeInventory?.trim() && inventory) {
+    inventoryFiles = await writeTaskControlInventory(inventory, opts.writeInventory.trim());
+  }
+
+  if (opts.sendFeishuSummary) {
+    if (!opts.summaryTarget?.trim()) {
+      runtime.error("--send-feishu-summary requires --summary-target");
+      runtime.exit(1);
+      return;
+    }
+    const { sendMessageFeishu } = await import("../../extensions/feishu/src/send.js");
+    const cfg = loadConfig();
+    const accountId = opts.summaryAccount?.trim() || opts.feishuAccount?.trim() || "jarvis";
+    await sendMessageFeishu({
+      cfg,
+      to: opts.summaryTarget.trim(),
+      text: projectionLayer.summary.text,
+      accountId,
+    });
+    summaryDelivery = {
+      channel: "feishu",
+      accountId,
+      target: opts.summaryTarget.trim(),
+    };
+  }
+
+  if (opts.json) {
+    runtime.log(
+      JSON.stringify(
+        {
+          generatedAt: model.generatedAt,
+          source: model.source,
+          taskCatalog: model.taskCatalog,
+          taskSnapshot: model.taskSnapshot,
+          taskLedger: model.taskLedger,
+          healthModel: model.healthModel,
+          errorClassification: model.errorClassification,
+          projectionLayer,
+          ...(inventory
+            ? {
+                inventory: {
+                  workspaceInventory: inventory.workspaceInventory,
+                  cronInventory: inventory.cronInventory,
+                  pathInventory: inventory.pathInventory,
+                  providerInventory: inventory.providerInventory,
+                },
+                inventoryStatus: inventory.inventoryStatus,
+                warnings: inventory.warnings,
+              }
+            : {}),
+          ...(cronPathRepair ? { cronPathRepair } : {}),
+          ...(inventoryFiles ? { inventoryFiles } : {}),
+          ...(summaryFilePath ? { summaryFilePath } : {}),
+          ...(summaryDelivery ? { summaryDelivery } : {}),
+          ...(projectionSync ? { projectionSync } : {}),
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  runtime.log(info("Task Control Plane"));
+  runtime.log(
+    info(
+      `Catalog: ${model.taskCatalog.total} tasks · Snapshot: ${model.taskSnapshot.active} active / ${model.taskSnapshot.failures} failures`,
+    ),
+  );
+  runtime.log(
+    info(
+      `Health: ${model.healthModel.overallSeverity} · critical ${model.healthModel.summary.critical} · warn ${model.healthModel.summary.warn}`,
+    ),
+  );
+  runtime.log(
+    info(
+      `Errors: ${model.errorClassification.problematic} problematic · views ${projectionLayer.feishu.views.map((view) => view.name).join(", ")}`,
+    ),
+  );
+  if (inventory) {
+    runtime.log(
+      info(
+        `Inventory: ${inventory.workspaceInventory.total} workspaces · ${inventory.cronInventory.total} cron jobs · ${inventory.pathInventory.total} path refs · ${inventory.providerInventory.entries.length} providers`,
+      ),
+    );
+    const alertingCronNames = inventory.cronInventory.entries
+      .filter((entry) => entry.operationalStatus === "alerting")
+      .map((entry) => entry.name)
+      .slice(0, 3);
+    runtime.log(
+      info(
+        `Cron operational: enabled healthy ${inventory.cronInventory.summary.enabledHealthy} · enabled alerting ${inventory.cronInventory.summary.enabledAlerting} · enabled unknown ${inventory.cronInventory.summary.enabledUnknown} · disabled historical ${inventory.cronInventory.summary.disabledWithHistoricalErrors}${alertingCronNames.length > 0 ? ` · focus ${alertingCronNames.join(", ")}` : ""}`,
+      ),
+    );
+    if (inventory.warnings.length > 0) {
+      for (const warning of inventory.warnings) {
+        runtime.log(info(`Inventory warning: ${warning}`));
+      }
+    }
+  }
+  if (inventoryFiles) {
+    runtime.log(info(`Inventory dir: ${inventoryFiles.rootDir}`));
+  }
+  if (cronPathRepair) {
+    runtime.log(
+      info(
+        `Cron path repair: ${cronPathRepair.changedJobs} changed / ${cronPathRepair.totalJobs} total (${cronPathRepair.applied ? "applied" : "preview"})`,
+      ),
+    );
+  }
+  if (projectionSync) {
+    runtime.log(
+      info(
+        `Feishu sync: ${projectionSync.rowsCreated} created · ${projectionSync.rowsUpdated} updated · ${projectionSync.viewsCreated} views created · ${projectionSync.viewsUpdated} views patched`,
+      ),
+    );
+  }
+  if (summaryFilePath) {
+    runtime.log(info(`Summary file: ${summaryFilePath}`));
+  }
+  if (summaryDelivery) {
+    runtime.log(
+      info(
+        `Summary delivered: ${summaryDelivery.channel}:${summaryDelivery.accountId} -> ${summaryDelivery.target}`,
+      ),
+    );
+  }
+  runtime.log("Re-run with `openclaw tasks control --json` for the full control-plane payload.");
 }

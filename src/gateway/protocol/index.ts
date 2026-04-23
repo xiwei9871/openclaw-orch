@@ -230,15 +230,10 @@ import {
   SessionsSendParamsSchema,
   type SessionsUsageParams,
   SessionsUsageParamsSchema,
-  type TasksCreateParams,
   TasksCreateParamsSchema,
-  type TasksDispatchParams,
   TasksDispatchParamsSchema,
-  type TasksResultParams,
   TasksResultParamsSchema,
-  type TasksGetParams,
   TasksGetParamsSchema,
-  type TasksTreeParams,
   TasksTreeParamsSchema,
   type ShutdownEvent,
   ShutdownEventSchema,
@@ -298,6 +293,13 @@ import {
   type WizardStep,
   WizardStepSchema,
 } from "./schema.js";
+import type {
+  TasksCreateParams,
+  TasksDispatchParams,
+  TasksResultParams,
+  TasksGetParams,
+  TasksTreeParams,
+} from "./schema/types.js";
 
 const ajv = new (AjvPkg as unknown as new (opts?: object) => import("ajv").default)({
   allErrors: true,

@@ -118,6 +118,19 @@ export type CronServiceDepsInternal = Omit<CronServiceDeps, "nowMs"> & {
   nowMs: () => number;
 };
 
+export type CronNetworkRecoveryState = {
+  lastNetworkFailureAtMs?: number;
+  lastStableSuccessAtMs?: number;
+  lastRecoveryCatchupTriggeredAtMs?: number;
+  probeBackoffMs?: number;
+  nextProbeAtMs?: number;
+  lastProbeWindowFailureAtMs?: number;
+  lastFeishuProbeOkAtMs?: number;
+  lastLlmProbeOkAtMs?: number;
+  lastFeishuProbeError?: string;
+  lastLlmProbeError?: string;
+};
+
 export type CronServiceState = {
   deps: CronServiceDepsInternal;
   store: CronStoreFile | null;
@@ -127,6 +140,7 @@ export type CronServiceState = {
   warnedDisabled: boolean;
   storeLoadedAtMs: number | null;
   storeFileMtimeMs: number | null;
+  networkRecovery: CronNetworkRecoveryState;
 };
 
 export function createCronServiceState(deps: CronServiceDeps): CronServiceState {
@@ -139,6 +153,7 @@ export function createCronServiceState(deps: CronServiceDeps): CronServiceState 
     warnedDisabled: false,
     storeLoadedAtMs: null,
     storeFileMtimeMs: null,
+    networkRecovery: {},
   };
 }
 

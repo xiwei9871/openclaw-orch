@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeEnv } from "../runtime.js";
 import { createRunningTaskRun } from "../tasks/task-executor.js";
@@ -10,7 +12,13 @@ import {
   resetTaskRegistryForTests,
 } from "../tasks/task-registry.js";
 import { withTempDir } from "../test-helpers/temp-dir.js";
-import { tasksAuditCommand, tasksMaintenanceCommand } from "./tasks.js";
+import { tasksAuditCommand, tasksControlCommand, tasksMaintenanceCommand } from "./tasks.js";
+
+const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../../extensions/feishu/src/send.js", () => ({
+  sendMessageFeishu: sendMessageFeishuMock,
+}));
 
 const ORIGINAL_STATE_DIR = process.env.OPENCLAW_STATE_DIR;
 
@@ -171,6 +179,261 @@ describe("tasks commands", () => {
       expect(payload.auditBefore.taskFlows.byCode.stale_running).toBe(0);
       expect(payload.auditAfter.byCode).toBeDefined();
       expect(payload.auditAfter.taskFlows.byCode.stale_running).toBe(0);
+    });
+  });
+
+  it("emits task control plane JSON with read models and projection layer", async () => {
+    await withTaskCommandStateDir(async () => {
+      const now = Date.UTC(2026, 3, 10, 6, 0, 0);
+      vi.useFakeTimers();
+      vi.setSystemTime(now - 35 * 60_000);
+      createRunningTaskRun({
+        runtime: "cli",
+        ownerKey: "agent:agent_jarvis:main",
+        scopeKind: "session",
+        runId: "task-control-running",
+        task: "Review control plane payload",
+      });
+      vi.setSystemTime(now - 20 * 60_000);
+      createRunningTaskRun({
+        runtime: "cli",
+        ownerKey: "agent:agent_alpha:main",
+        scopeKind: "session",
+        runId: "task-control-failure",
+        task: "Write projection adapter",
+      });
+      vi.setSystemTime(now - 5 * 60_000);
+      createManagedTaskFlow({
+        ownerKey: "agent:agent_jarvis:main",
+        controllerId: "tests/tasks-control",
+        goal: "Track control plane",
+        status: "waiting",
+        createdAt: now - 30 * 60_000,
+        updatedAt: now - 5 * 60_000,
+      });
+
+      const runtime = createRuntime();
+      await tasksControlCommand({ json: true, timeZone: "Asia/Shanghai" }, runtime);
+
+      const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
+        taskCatalog: { total: number };
+        taskSnapshot: { total: number; items: Array<{ runId?: string; status: string }> };
+        taskLedger: { total: number; byDay: Array<{ dayKey: string }> };
+        healthModel: { summary: { total: number } };
+        errorClassification: { total: number };
+        projectionLayer: {
+          feishu: { views: Array<{ name: string }>; rows: Array<{ taskId: string }> };
+          summary: { text: string };
+        };
+      };
+
+      expect(payload.taskCatalog.total).toBeGreaterThanOrEqual(2);
+      expect(payload.taskSnapshot.total).toBeGreaterThanOrEqual(2);
+      expect(payload.taskSnapshot.items.some((item) => item.runId === "task-control-running")).toBe(
+        true,
+      );
+      expect(payload.taskLedger.total).toBe(payload.taskCatalog.total);
+      expect(payload.taskLedger.byDay[0]?.dayKey).toBe("2026-04-10");
+      expect(payload.healthModel.summary.total).toBe(payload.taskCatalog.total);
+      expect(payload.errorClassification.total).toBe(payload.taskCatalog.total);
+      expect(payload.projectionLayer.feishu.views.map((view) => view.name)).toEqual([
+        "总览",
+        "异常",
+        "今日队列",
+        "Agent 视图",
+      ]);
+      expect(payload.projectionLayer.feishu.rows.length).toBe(payload.taskSnapshot.total);
+      expect(payload.projectionLayer.summary.text).toContain("Task Control 每日健康报告");
+    });
+  });
+
+  it("writes and sends the Jarvis summary without requiring a scheduler", async () => {
+    await withTaskCommandStateDir(async () => {
+      const now = Date.UTC(2026, 3, 10, 6, 0, 0);
+      vi.useFakeTimers();
+      vi.setSystemTime(now - 10 * 60_000);
+      createRunningTaskRun({
+        runtime: "cli",
+        ownerKey: "agent:agent_jarvis:main",
+        scopeKind: "session",
+        runId: "task-summary-running",
+        task: "Prepare daily health summary",
+      });
+
+      await withTempDir({ prefix: "openclaw-task-summary-" }, async (root) => {
+        const summaryPath = path.join(root, "task_health.md");
+        const runtime = createRuntime();
+        sendMessageFeishuMock.mockResolvedValue({
+          messageId: "om_summary",
+          chatId: "oc_group_1",
+        });
+
+        await tasksControlCommand(
+          {
+            writeSummary: summaryPath,
+            sendFeishuSummary: true,
+            summaryTarget: "chat:oc_group_1",
+            summaryAccount: "jarvis",
+          },
+          runtime,
+        );
+
+        const written = await fs.readFile(summaryPath, "utf8");
+        expect(written).toContain("# Task Control 每日健康报告");
+        expect(written).toContain("生成时间：");
+        expect(written).toContain("总体：");
+        expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            accountId: "jarvis",
+            to: "chat:oc_group_1",
+            text: expect.stringContaining("Task Control 每日健康报告"),
+          }),
+        );
+      });
+    });
+  });
+
+  it("emits inventory JSON and writes inventory files when requested", async () => {
+    await withTaskCommandStateDir(async () => {
+      await withTempDir({ prefix: "openclaw-task-inventory-" }, async (root) => {
+        const inventoryDir = path.join(root, "inventory");
+        const runtime = createRuntime();
+
+        await tasksControlCommand(
+          {
+            json: true,
+            inventory: true,
+            writeInventory: inventoryDir,
+          },
+          runtime,
+        );
+
+        const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
+          inventory: {
+            workspaceInventory: { total: number };
+            cronInventory: {
+              total: number;
+              summary: {
+                enabledHealthy: number;
+                enabledAlerting: number;
+                enabledUnknown: number;
+                disabledHealthy: number;
+                disabledWithHistoricalErrors: number;
+              };
+            };
+            pathInventory: { total: number };
+            providerInventory: { entries: unknown[] };
+          };
+          inventoryStatus: {
+            workspace: string;
+            cron: string;
+            path: string;
+            provider: string;
+          };
+          warnings: string[];
+          inventoryFiles: {
+            rootDir: string;
+            files: Record<string, string>;
+          };
+        };
+
+        expect(payload.inventory.workspaceInventory.total).toBeGreaterThanOrEqual(0);
+        expect(payload.inventory.cronInventory.total).toBeGreaterThanOrEqual(0);
+        expect(payload.inventory.cronInventory.summary).toBeDefined();
+        expect(payload.inventory.pathInventory.total).toBeGreaterThanOrEqual(0);
+        expect(payload.inventory.providerInventory.entries).toBeDefined();
+        expect(payload.inventoryStatus.provider).toBeDefined();
+        expect(Array.isArray(payload.warnings)).toBe(true);
+        expect(payload.inventoryFiles.rootDir).toBe(inventoryDir);
+        await expect(
+          fs.readFile(payload.inventoryFiles.files.workspaces, "utf8"),
+        ).resolves.toContain('"entries":');
+      });
+    });
+  });
+
+  it("logs cron operational summary in human-readable tasks control output", async () => {
+    await withTaskCommandStateDir(async () => {
+      const runtime = createRuntime();
+
+      await tasksControlCommand(
+        {
+          inventory: true,
+        },
+        runtime,
+      );
+
+      const output = vi
+        .mocked(runtime.log)
+        .mock.calls.map((call) => String(call[0]))
+        .join("\n");
+
+      expect(output).toContain("Cron operational:");
+      expect(output).toContain("enabled healthy");
+    });
+  });
+
+  it("keeps pure-read tasks control commands working when config is invalid", async () => {
+    await withTaskCommandStateDir(async () => {
+      await fs.writeFile(
+        path.join(process.env.OPENCLAW_STATE_DIR!, "openclaw.json"),
+        "{ invalid json",
+        "utf8",
+      );
+
+      const runtime = createRuntime();
+      await tasksControlCommand(
+        {
+          json: true,
+          inventory: true,
+          previewCronPathRepair: true,
+        },
+        runtime,
+      );
+
+      const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
+        inventory: {
+          cronInventory: { total: number };
+          providerInventory: { configReadable: boolean; providerInventoryDegraded: boolean };
+        };
+        inventoryStatus: { provider: string };
+        warnings: string[];
+        cronPathRepair: { applied: boolean; totalJobs: number };
+      };
+
+      expect(payload.inventory.cronInventory.total).toBeGreaterThanOrEqual(0);
+      expect(payload.inventory.providerInventory.configReadable).toBe(false);
+      expect(payload.inventory.providerInventory.providerInventoryDegraded).toBe(true);
+      expect(payload.inventoryStatus.provider).toBe("degraded");
+      expect(
+        payload.warnings.some((warning) => warning.includes("provider inventory degraded")),
+      ).toBe(true);
+      expect(payload.cronPathRepair.applied).toBe(false);
+    });
+  });
+
+  it("previews cron path repair through tasks control", async () => {
+    await withTaskCommandStateDir(async () => {
+      const runtime = createRuntime();
+
+      await tasksControlCommand(
+        {
+          json: true,
+          previewCronPathRepair: true,
+        },
+        runtime,
+      );
+
+      const payload = JSON.parse(String(vi.mocked(runtime.log).mock.calls[0]?.[0])) as {
+        cronPathRepair: {
+          applied: boolean;
+          changedJobs: number;
+          totalJobs: number;
+        };
+      };
+
+      expect(payload.cronPathRepair.applied).toBe(false);
+      expect(payload.cronPathRepair.totalJobs).toBeGreaterThanOrEqual(0);
     });
   });
 });
