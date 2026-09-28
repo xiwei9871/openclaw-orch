@@ -16,11 +16,6 @@ import {
   validateTasksTreeParams,
   ErrorCodes,
   errorShape,
-  type TasksCreateParams,
-  type TasksDispatchParams,
-  type TasksGetParams,
-  type TasksResultParams,
-  type TasksTreeParams,
 } from "../protocol/index.js";
 import { agentHandlers } from "./agent.js";
 import type { GatewayRequestHandlerOptions, GatewayRequestHandlers } from "./types.js";
@@ -93,7 +88,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     if (!assertValidParams(params, validateTasksCreateParams, "tasks.create", respond)) {
       return;
     }
-    const p = params as TasksCreateParams;
+    const p = params;
     const taskType = p.taskType ?? classifyTaskTypeFromInstruction(p.instruction);
     const ownerAgent = resolveOwnerAgent(taskType);
     const taskStore = new TaskStore();
@@ -119,7 +114,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     if (!assertValidParams(params, validateTasksDispatchParams, "tasks.dispatch", respond)) {
       return;
     }
-    const p = params as TasksDispatchParams;
+    const p = params;
     const taskStore = new TaskStore();
     const task = taskStore.getTask(p.taskId);
     if (!task) {
@@ -166,7 +161,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     if (!assertValidParams(params, validateTasksResultParams, "tasks.result", respond)) {
       return;
     }
-    const p = params as TasksResultParams;
+    const p = params;
     const taskStore = new TaskStore();
     const task = taskStore.getTask(p.taskId);
     if (!task) {
@@ -245,7 +240,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     if (!assertValidParams(params, validateTasksGetParams, "tasks.get", respond)) {
       return;
     }
-    const p = params as TasksGetParams;
+    const p = params;
     const task = new TaskStore().getTask(p.taskId);
     if (!task) {
       respondMissingTask(p.taskId, respond);
@@ -258,7 +253,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     if (!assertValidParams(params, validateTasksTreeParams, "tasks.tree", respond)) {
       return;
     }
-    const p = params as TasksTreeParams;
+    const p = params;
     const tree = new TaskStore().getTaskTree(p.taskId);
     if (!tree) {
       respondMissingTask(p.taskId, respond);

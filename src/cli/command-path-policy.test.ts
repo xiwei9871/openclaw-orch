@@ -58,5 +58,12 @@ describe("command-path-policy", () => {
       hideBanner: false,
       ensureCliPath: true,
     });
+    expect(resolveCliCommandPathPolicy(["tasks", "control"])).toEqual({
+      bypassConfigGuard: true,
+      routeConfigGuard: "never",
+      loadPlugins: "never",
+      hideBanner: false,
+      ensureCliPath: true,
+    });
   });
 });

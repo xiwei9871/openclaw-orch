@@ -7,6 +7,7 @@ import { statusCommand } from "../../commands/status.js";
 import {
   tasksAuditCommand,
   tasksCancelCommand,
+  tasksControlCommand,
   tasksListCommand,
   tasksMaintenanceCommand,
   tasksNotifyCommand,
@@ -375,6 +376,48 @@ export function registerStatusHealthSessionsCommands(program: Command) {
         await tasksCancelCommand(
           {
             lookup,
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksCmd
+    .command("control")
+    .description("Show Task Control Plane read models and projections")
+    .option("--json", "Output as JSON", false)
+    .option("--time-zone <iana>", "IANA timezone for today-queue projection")
+    .option("--sync-feishu", "Sync Feishu Task_Control projection into a Bitable table", false)
+    .option("--account <id>", "Feishu account id to use for Bitable sync")
+    .option("--app-token <token>", "Feishu Bitable app token")
+    .option("--table-id <id>", "Feishu Bitable table id")
+    .option("--write-summary <path>", "Write Jarvis task health summary to a markdown file")
+    .option("--send-feishu-summary", "Send Jarvis task health summary to Feishu", false)
+    .option("--summary-target <target>", "Feishu send target such as chat:oc_xxx")
+    .option("--summary-account <id>", "Feishu account id used for summary delivery")
+    .option("--inventory", "Include workspace/cron/path/provider inventory", false)
+    .option("--write-inventory <dir>", "Write inventory JSON files into a directory")
+    .option("--preview-cron-path-repair", "Preview cron payload path normalization", false)
+    .option("--apply-cron-path-repair", "Apply cron payload path normalization", false)
+    .action(async (opts, command) => {
+      const parentOpts = command.parent?.opts() as { json?: boolean } | undefined;
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        await tasksControlCommand(
+          {
+            json: Boolean(opts.json || parentOpts?.json),
+            timeZone: opts.timeZone as string | undefined,
+            syncFeishu: Boolean(opts.syncFeishu),
+            feishuAccount: opts.account as string | undefined,
+            appToken: opts.appToken as string | undefined,
+            tableId: opts.tableId as string | undefined,
+            writeSummary: opts.writeSummary as string | undefined,
+            sendFeishuSummary: Boolean(opts.sendFeishuSummary),
+            summaryTarget: opts.summaryTarget as string | undefined,
+            summaryAccount: opts.summaryAccount as string | undefined,
+            inventory: Boolean(opts.inventory),
+            writeInventory: opts.writeInventory as string | undefined,
+            previewCronPathRepair: Boolean(opts.previewCronPathRepair),
+            applyCronPathRepair: Boolean(opts.applyCronPathRepair),
           },
           defaultRuntime,
         );

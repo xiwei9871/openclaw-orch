@@ -252,11 +252,12 @@ export function buildGatewayCronService(params: {
   const taskBoardConfig = resolveFeishuTaskBoardConfig(params.cfg);
   const taskBoardAdapter = createConfiguredFeishuTaskBoardAdapter(params.cfg);
   setTaskBoardSyncBoard(taskBoardAdapter ? createTaskBoardSyncBoard(taskBoardAdapter) : null);
-  if (taskBoardConfig?.summarySessionKey) {
+  const summarySessionKey = taskBoardConfig?.summarySessionKey;
+  if (summarySessionKey) {
     setJarvisTaskNotifier(
       createJarvisTaskNotifier({
         send: async (text) => {
-          enqueueSystemEvent(text, { sessionKey: taskBoardConfig.summarySessionKey });
+          enqueueSystemEvent(text, { sessionKey: summarySessionKey });
         },
       }),
     );

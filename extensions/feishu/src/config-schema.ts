@@ -20,6 +20,7 @@ const FeishuDomainSchema = z.union([
   z.string().url().startsWith("https://"),
 ]);
 const FeishuConnectionModeSchema = z.enum(["websocket", "webhook"]);
+const FeishuAppTypeSchema = z.enum(["custom", "self_build", "internal"]).optional();
 
 const ToolPolicySchema = z
   .object({
@@ -204,6 +205,10 @@ export const FeishuAccountConfigSchema = z
   .object({
     enabled: z.boolean().optional(),
     name: z.string().optional(), // Display name for this account
+    botName: z.string().optional(),
+    botRole: z.string().optional(),
+    botDescription: z.string().optional(),
+    botOpenId: z.string().optional(),
     appId: z.string().optional(),
     appSecret: buildSecretInputSchema().optional(),
     encryptKey: buildSecretInputSchema().optional(),
@@ -220,6 +225,7 @@ export const FeishuAccountConfigSchema = z
 export const FeishuConfigSchema = z
   .object({
     enabled: z.boolean().optional(),
+    appType: FeishuAppTypeSchema,
     defaultAccount: z.string().optional(),
     // Top-level credentials (backward compatible for single-account mode)
     appId: z.string().optional(),

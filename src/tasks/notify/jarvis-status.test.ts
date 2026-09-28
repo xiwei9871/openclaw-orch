@@ -95,7 +95,7 @@ describe("createJarvisTaskNotifier", () => {
   });
 
   it("sends immediate failure alerts and suppresses duplicates inside cooldown", async () => {
-    const send = vi.fn(async () => undefined);
+    const send = vi.fn<(text: string) => Promise<void>>(async () => undefined);
     const notifier = createJarvisTaskNotifier({
       send,
       now: vi

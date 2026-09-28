@@ -79,10 +79,5 @@ export const TasksTreeParamsSchema = Type.Object(
   { additionalProperties: false },
 );
 
-export type TasksCreateParams = Static<typeof TasksCreateParamsSchema>;
-export type TasksDispatchParams = Static<typeof TasksDispatchParamsSchema>;
-export type TasksResultParams = Static<typeof TasksResultParamsSchema>;
-export type TasksGetParams = Static<typeof TasksGetParamsSchema>;
-export type TasksTreeParams = Static<typeof TasksTreeParamsSchema>;
 export type GatewayTaskType = Static<typeof TaskTypeSchema>;
 export type GatewayTaskStatus = Static<typeof TaskStatusSchema>;

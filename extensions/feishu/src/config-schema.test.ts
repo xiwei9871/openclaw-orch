@@ -220,6 +220,30 @@ describe("FeishuConfigSchema optimization flags", () => {
   });
 });
 
+describe("FeishuConfigSchema compatibility fields", () => {
+  it("accepts top-level appType for backward-compatible configs", () => {
+    const result = FeishuConfigSchema.parse({
+      appType: "custom",
+    });
+    expect(result.appType).toBe("custom");
+  });
+
+  it("accepts legacy account bot metadata fields", () => {
+    const result = FeishuConfigSchema.parse({
+      accounts: {
+        jarvis: {
+          botName: "贾维斯",
+          botRole: "总管 / 项目经理",
+          botDescription: "全局管理、决策、可靠统筹",
+          botOpenId: "ou_jarvis_bot",
+        },
+      },
+    });
+    expect(result.accounts?.jarvis?.botName).toBe("贾维斯");
+    expect(result.accounts?.jarvis?.botOpenId).toBe("ou_jarvis_bot");
+  });
+});
+
 describe("FeishuConfigSchema actions", () => {
   it("accepts top-level reactions action gate", () => {
     const result = FeishuConfigSchema.parse({

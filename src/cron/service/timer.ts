@@ -1,4 +1,5 @@
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
+import { getRuntimeConfig } from "../../config/io.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
 import { DEFAULT_AGENT_ID } from "../../routing/session-key.js";
@@ -9,6 +10,15 @@ import {
 } from "../../tasks/task-executor.js";
 import { clearCronJobActive, markCronJobActive } from "../active-jobs.js";
 import { resolveCronDeliveryPlan } from "../delivery-plan.js";
+import { resolveCronModelSelection } from "../isolated-agent/model-selection.js";
+import { buildCronAgentDefaultsConfig } from "../isolated-agent/run-config.js";
+import {
+  normalizeAgentId,
+  resolveAgentConfig,
+  resolveDefaultAgentId,
+} from "../isolated-agent/run.runtime.js";
+import { resolveCronAgentSessionKey } from "../isolated-agent/session-key.js";
+import { resolveCronSession } from "../isolated-agent/session.js";
 import { sweepCronRunSessions } from "../session-reaper.js";
 import type {
   CronDeliveryStatus,
@@ -49,6 +59,362 @@ const DEFAULT_MISSED_JOB_STAGGER_MS = 5_000;
 const DEFAULT_MAX_MISSED_JOBS_PER_RESTART = 5;
 const DEFAULT_FAILURE_ALERT_AFTER = 2;
 const DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000; // 1 hour
+const FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS = new Set([
+  "c0ff4e45-9a3c-417e-a324-a95d65a16a28",
+  "049a87d5-7cc5-4b65-a07f-a4ab47995ec4",
+  "07084743-7475-446e-8013-63fc2afa88bc",
+  "81380d51-2a99-4f03-a8ef-e57e35faeb26",
+]);
+
+const NETWORK_RECOVERY_PATTERNS = [
+  /network error/i,
+  /network connection error/i,
+  /\bENOTFOUND\b/i,
+  /\bECONNRESET\b/i,
+  /\bECONNREFUSED\b/i,
+  /\bETIMEDOUT\b/i,
+  /getaddrinfo/i,
+];
+
+export function resolveNextNetworkProbeDelayMs(previousDelayMs?: number): number {
+  if (previousDelayMs === undefined) {
+    return 15_000;
+  }
+  if (previousDelayMs < 30_000) {
+    return 30_000;
+  }
+  return 60_000;
+}
+
+function shouldRunNetworkProbe(state: CronServiceState, nowMs: number): boolean {
+  const recovery = state.networkRecovery;
+  if (typeof recovery.lastNetworkFailureAtMs !== "number") {
+    return false;
+  }
+  if (
+    typeof recovery.lastRecoveryCatchupTriggeredAtMs === "number" &&
+    recovery.lastRecoveryCatchupTriggeredAtMs >= recovery.lastNetworkFailureAtMs
+  ) {
+    return false;
+  }
+  return typeof recovery.nextProbeAtMs !== "number" || nowMs >= recovery.nextProbeAtMs;
+}
+
+type NetworkProbeResult = { ok: true } | { ok: false; error: string };
+
+function normalizeProbeResult(input: unknown): NetworkProbeResult {
+  if (input === true) {
+    return { ok: true };
+  }
+  if (input === false) {
+    return { ok: false, error: "probe failed" };
+  }
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    "ok" in input &&
+    (input as { ok?: unknown }).ok === true
+  ) {
+    return { ok: true };
+  }
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    "ok" in input &&
+    (input as { ok?: unknown }).ok === false
+  ) {
+    const error = (input as { error?: unknown }).error;
+    return { ok: false, error: typeof error === "string" && error.trim() ? error : "probe failed" };
+  }
+  return { ok: false, error: "probe failed" };
+}
+
+async function probeFeishuRecovery(): Promise<NetworkProbeResult> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(timeoutErrorMessage()), 7_500);
+  try {
+    const response = await fetch("https://open.feishu.cn/", {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (response.status >= 200 && response.status < 500) {
+      return { ok: true };
+    }
+    return { ok: false, error: `HTTP ${response.status}` };
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function sanitizeProbeIdComponent(input: string): string {
+  // Cron job ids are used as stable keys; keep them ASCII and avoid '/'.
+  return input.replace(/[^a-zA-Z0-9_.:-]+/g, "_").slice(0, 160);
+}
+
+async function resolveFounderOsCriticalLlmProbeTargets(params: {
+  state: CronServiceState;
+  cfg: ReturnType<typeof getRuntimeConfig>;
+}): Promise<
+  {
+    provider: string;
+    model: string;
+    agentId: string;
+    baseSessionKey: string;
+  }[]
+> {
+  const { state, cfg } = params;
+  if (!state.store?.jobs?.length) {
+    return [];
+  }
+
+  const deduped = new Map<
+    string,
+    { provider: string; model: string; agentId: string; baseSessionKey: string }
+  >();
+
+  const defaultAgentId = resolveDefaultAgentId(cfg) ?? DEFAULT_AGENT_ID;
+
+  for (const job of state.store.jobs) {
+    if (!FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS.has(job.id)) {
+      continue;
+    }
+    if (job.payload.kind !== "agentTurn") {
+      continue;
+    }
+
+    const baseSessionKey = (job.sessionKey?.trim() || `cron:${job.id}`).trim();
+    const requestedAgentIdRaw =
+      typeof job.agentId === "string" && job.agentId.trim() ? job.agentId.trim() : undefined;
+    const normalizedRequested = requestedAgentIdRaw
+      ? normalizeAgentId(requestedAgentIdRaw)
+      : undefined;
+    const agentId = normalizedRequested ?? defaultAgentId;
+    const agentConfigOverride = normalizedRequested
+      ? resolveAgentConfig(cfg, normalizedRequested)
+      : undefined;
+
+    const agentCfg = buildCronAgentDefaultsConfig({
+      defaults: cfg.agents?.defaults,
+      agentConfigOverride,
+    });
+    const cfgWithAgentDefaults = {
+      ...cfg,
+      agents: Object.assign({}, cfg.agents, { defaults: agentCfg }),
+    };
+
+    const agentSessionKey = resolveCronAgentSessionKey({
+      sessionKey: baseSessionKey,
+      agentId,
+      mainKey: cfg.session?.mainKey,
+      cfg,
+    });
+    const cronSession = resolveCronSession({
+      cfg,
+      sessionKey: agentSessionKey,
+      agentId,
+      nowMs: state.deps.nowMs(),
+      // LLM probes run as isolated cron jobs; session overrides still apply.
+      forceNew: true,
+    });
+
+    const resolveForPayload = async (payload: CronJob["payload"]) => {
+      return await resolveCronModelSelection({
+        cfg,
+        cfgWithAgentDefaults,
+        agentConfigOverride,
+        sessionEntry: cronSession.sessionEntry,
+        payload,
+        isGmailHook: false,
+      });
+    };
+
+    // Primary: what this job would run today with its actual payload (includes session overrides).
+    const primaryResolved = await resolveForPayload(job.payload);
+    if (!primaryResolved.ok) {
+      throw new Error(primaryResolved.error);
+    }
+
+    const addTarget = (provider: string, model: string) => {
+      const key = `${agentId}|${baseSessionKey}|${provider}/${model}`;
+      if (!deduped.has(key)) {
+        deduped.set(key, {
+          provider,
+          model,
+          agentId,
+          baseSessionKey,
+        });
+      }
+    };
+    addTarget(primaryResolved.provider, primaryResolved.model);
+
+    // Secondary: probe any configured fallbacks as additional provider/model combos.
+    if (Array.isArray(job.payload.fallbacks)) {
+      for (const fallback of job.payload.fallbacks) {
+        if (typeof fallback !== "string" || !fallback.trim()) {
+          continue;
+        }
+        const candidatePayload: CronJob["payload"] = {
+          ...job.payload,
+          model: fallback.trim(),
+        };
+        const resolvedFallback = await resolveForPayload(candidatePayload);
+        if (resolvedFallback.ok) {
+          addTarget(resolvedFallback.provider, resolvedFallback.model);
+        }
+      }
+    }
+  }
+
+  return [...deduped.values()];
+}
+
+function createLlmProbeJob(params: {
+  nowMs: number;
+  agentId: string;
+  provider: string;
+  model: string;
+  baseSessionKey: string;
+}): CronJob {
+  const modelRef = `${params.provider}/${params.model}`;
+  const safeKey = sanitizeProbeIdComponent(params.baseSessionKey);
+  const safeModel = sanitizeProbeIdComponent(modelRef);
+  return {
+    id: `cron:network-recovery-probe:${safeKey}:${safeModel}`,
+    name: `network recovery probe (${params.provider}/${params.model})`,
+    enabled: true,
+    createdAtMs: params.nowMs,
+    updatedAtMs: params.nowMs,
+    schedule: { kind: "at", at: new Date(params.nowMs).toISOString() },
+    sessionTarget: "isolated",
+    wakeMode: "now",
+    agentId: params.agentId,
+    // Preserve the same isolated-run identity as the real cron job so session
+    // auth/profile overrides are honored by the probe.
+    sessionKey: params.baseSessionKey,
+    payload: {
+      kind: "agentTurn",
+      message: "Network probe: reply with OK.",
+      model: modelRef,
+      lightContext: true,
+      toolsAllow: [],
+      timeoutSeconds: 15,
+    },
+    state: { nextRunAtMs: params.nowMs },
+  };
+}
+
+async function probeLlmRecovery(state: CronServiceState): Promise<NetworkProbeResult> {
+  let cfg: ReturnType<typeof getRuntimeConfig>;
+  try {
+    cfg = getRuntimeConfig();
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  }
+
+  let refs: { provider: string; model: string; agentId: string; baseSessionKey: string }[];
+  try {
+    // Intentionally reuse isolated-cron model/session resolution so probe targets match
+    // the real runtime path (including session auth/profile overrides).
+    refs = await resolveFounderOsCriticalLlmProbeTargets({ state, cfg });
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  }
+  if (refs.length === 0) {
+    return { ok: true };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(timeoutErrorMessage()), 20_000);
+  try {
+    for (const ref of refs) {
+      const nowMs = state.deps.nowMs();
+      const job = createLlmProbeJob({
+        nowMs,
+        agentId: ref.agentId,
+        provider: ref.provider,
+        model: ref.model,
+        baseSessionKey: ref.baseSessionKey,
+      });
+      const res = await state.deps.runIsolatedAgentJob({
+        job,
+        message: job.payload.kind === "agentTurn" ? job.payload.message : "Network probe",
+        abortSignal: controller.signal,
+      });
+      if (res.status !== "ok") {
+        return {
+          ok: false,
+          error: typeof res.error === "string" && res.error.trim() ? res.error : "llm probe failed",
+        };
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: normalizeCronRunErrorText(error) };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export async function maybeProbeNetworkRecovery(
+  state: CronServiceState,
+  overrides?: {
+    runFeishuProbe?: () => Promise<boolean | NetworkProbeResult>;
+    runLlmProbe?: () => Promise<boolean | NetworkProbeResult>;
+  },
+): Promise<void> {
+  const nowMs = state.deps.nowMs();
+  if (!shouldRunNetworkProbe(state, nowMs)) {
+    return;
+  }
+
+  const currentWindowFailureAtMs = state.networkRecovery.lastNetworkFailureAtMs;
+  if (typeof currentWindowFailureAtMs !== "number") {
+    return;
+  }
+  if (state.networkRecovery.lastProbeWindowFailureAtMs !== currentWindowFailureAtMs) {
+    state.networkRecovery.lastProbeWindowFailureAtMs = currentWindowFailureAtMs;
+    state.networkRecovery.probeBackoffMs = undefined;
+    state.networkRecovery.nextProbeAtMs = nowMs;
+    state.networkRecovery.lastFeishuProbeOkAtMs = undefined;
+    state.networkRecovery.lastLlmProbeOkAtMs = undefined;
+    state.networkRecovery.lastFeishuProbeError = undefined;
+    state.networkRecovery.lastLlmProbeError = undefined;
+  }
+
+  const feishu = overrides?.runFeishuProbe
+    ? normalizeProbeResult(await overrides.runFeishuProbe())
+    : await probeFeishuRecovery();
+  if (feishu.ok) {
+    state.networkRecovery.lastFeishuProbeOkAtMs = nowMs;
+    state.networkRecovery.lastFeishuProbeError = undefined;
+  } else {
+    state.networkRecovery.lastFeishuProbeError = feishu.error;
+  }
+
+  const llm = overrides?.runLlmProbe
+    ? normalizeProbeResult(await overrides.runLlmProbe())
+    : await probeLlmRecovery(state);
+  if (llm.ok) {
+    state.networkRecovery.lastLlmProbeOkAtMs = nowMs;
+    state.networkRecovery.lastLlmProbeError = undefined;
+  } else {
+    state.networkRecovery.lastLlmProbeError = llm.error;
+  }
+
+  if (!feishu.ok || !llm.ok) {
+    const nextDelayMs = resolveNextNetworkProbeDelayMs(state.networkRecovery.probeBackoffMs);
+    state.networkRecovery.probeBackoffMs = nextDelayMs;
+    state.networkRecovery.nextProbeAtMs = nowMs + nextDelayMs;
+    return;
+  }
+
+  state.networkRecovery.probeBackoffMs = undefined;
+  state.networkRecovery.nextProbeAtMs = undefined;
+  await maybeRunNetworkRecoveryCatchup(state);
+}
 
 type TimedCronRunOutcome = CronRunOutcome &
   CronRunTelemetry & {
@@ -68,6 +434,14 @@ type StartupCatchupCandidate = {
 type StartupCatchupPlan = {
   candidates: StartupCatchupCandidate[];
   deferredJobIds: string[];
+};
+
+type CatchupScope = "restart" | "network-recovery";
+
+type CatchupOptions = {
+  skipJobIds?: ReadonlySet<string>;
+  criticalJobIds?: ReadonlySet<string>;
+  recoveryMode?: CatchupScope;
 };
 
 export async function executeJobCoreWithTimeout(
@@ -249,6 +623,44 @@ function resolveRetryConfig(cronConfig?: CronConfig) {
         : DEFAULT_BACKOFF_SCHEDULE_MS.slice(0, 3),
     retryOn: Array.isArray(retry?.retryOn) && retry.retryOn.length > 0 ? retry.retryOn : undefined,
   };
+}
+
+export function isNetworkRecoverableCronError(error: string | undefined): boolean {
+  if (!error) {
+    return false;
+  }
+  return NETWORK_RECOVERY_PATTERNS.some((pattern) => pattern.test(error));
+}
+
+function readNetworkRecoveryTimestamps(state: CronServiceState): {
+  lastFailure?: number;
+  lastStableSuccess?: number;
+  lastCatchupTriggered?: number;
+} {
+  return {
+    lastFailure: state.networkRecovery.lastNetworkFailureAtMs,
+    lastStableSuccess: state.networkRecovery.lastStableSuccessAtMs,
+    lastCatchupTriggered: state.networkRecovery.lastRecoveryCatchupTriggeredAtMs,
+  };
+}
+
+function writeNetworkRecoveryTimestamps(
+  state: CronServiceState,
+  updates: {
+    lastFailure?: number;
+    lastStableSuccess?: number;
+    lastCatchupTriggered?: number;
+  },
+): void {
+  if ("lastFailure" in updates) {
+    state.networkRecovery.lastNetworkFailureAtMs = updates.lastFailure;
+  }
+  if ("lastStableSuccess" in updates) {
+    state.networkRecovery.lastStableSuccessAtMs = updates.lastStableSuccess;
+  }
+  if ("lastCatchupTriggered" in updates) {
+    state.networkRecovery.lastRecoveryCatchupTriggeredAtMs = updates.lastCatchupTriggered;
+  }
 }
 
 function resolveDeliveryStatus(params: { job: CronJob; delivered?: boolean }): CronDeliveryStatus {
@@ -594,6 +1006,55 @@ function applyOutcomeToStoredJob(state: CronServiceState, result: TimedCronRunOu
   }
 }
 
+function recordNetworkRecoverySignal(
+  state: CronServiceState,
+  result: Pick<TimedCronRunOutcome, "jobId" | "status" | "error" | "endedAt">,
+): void {
+  if (!FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS.has(result.jobId)) {
+    return;
+  }
+  if (result.status === "error" && isNetworkRecoverableCronError(result.error)) {
+    writeNetworkRecoveryTimestamps(state, {
+      lastFailure: result.endedAt,
+      lastStableSuccess: undefined,
+      lastCatchupTriggered: undefined,
+    });
+    return;
+  }
+  if (result.status === "ok") {
+    writeNetworkRecoveryTimestamps(state, { lastStableSuccess: result.endedAt });
+  }
+}
+
+export async function maybeRunNetworkRecoveryCatchup(state: CronServiceState): Promise<void> {
+  const recovery = readNetworkRecoveryTimestamps(state);
+  const lastFailure = recovery.lastFailure;
+  if (typeof lastFailure !== "number") {
+    return;
+  }
+  const lastFeishuProbeOkAtMs = state.networkRecovery.lastFeishuProbeOkAtMs;
+  const lastLlmProbeOkAtMs = state.networkRecovery.lastLlmProbeOkAtMs;
+  if (
+    typeof lastFeishuProbeOkAtMs !== "number" ||
+    typeof lastLlmProbeOkAtMs !== "number" ||
+    lastFeishuProbeOkAtMs < lastFailure ||
+    lastLlmProbeOkAtMs < lastFailure
+  ) {
+    return;
+  }
+  if (
+    typeof recovery.lastCatchupTriggered === "number" &&
+    recovery.lastCatchupTriggered >= lastFailure
+  ) {
+    return;
+  }
+  await runMissedJobs(state, {
+    criticalJobIds: FOUNDER_OS_NETWORK_RECOVERY_JOB_IDS,
+    recoveryMode: "network-recovery",
+  });
+  writeNetworkRecoveryTimestamps(state, { lastCatchupTriggered: state.deps.nowMs() });
+}
+
 export function armTimer(state: CronServiceState) {
   if (state.timer) {
     clearTimeout(state.timer);
@@ -776,6 +1237,7 @@ export async function onTimer(state: CronServiceState) {
         await ensureLoaded(state, { forceReload: true, skipRecompute: true });
         for (const result of completedResults) {
           applyOutcomeToStoredJob(state, result);
+          recordNetworkRecoverySignal(state, result);
         }
 
         // Use maintenance-only recompute to avoid advancing past-due
@@ -787,6 +1249,9 @@ export async function onTimer(state: CronServiceState) {
         await persist(state);
       });
     }
+
+    await maybeProbeNetworkRecovery(state);
+    await maybeRunNetworkRecoveryCatchup(state);
   } finally {
     // Piggyback session reaper on timer tick (self-throttled to every 5 min).
     // Placed in `finally` so the reaper runs even when a long-running job keeps
@@ -939,10 +1404,7 @@ function collectRunnableJobs(
   );
 }
 
-export async function runMissedJobs(
-  state: CronServiceState,
-  opts?: { skipJobIds?: ReadonlySet<string> },
-) {
+export async function runMissedJobs(state: CronServiceState, opts?: CatchupOptions) {
   const plan = await planStartupCatchup(state, opts);
   if (plan.candidates.length === 0 && plan.deferredJobIds.length === 0) {
     return;
@@ -954,12 +1416,8 @@ export async function runMissedJobs(
 
 async function planStartupCatchup(
   state: CronServiceState,
-  opts?: { skipJobIds?: ReadonlySet<string> },
+  opts?: CatchupOptions,
 ): Promise<StartupCatchupPlan> {
-  const maxImmediate = Math.max(
-    0,
-    state.deps.maxMissedJobsPerRestart ?? DEFAULT_MAX_MISSED_JOBS_PER_RESTART,
-  );
   return locked(state, async () => {
     await ensureLoaded(state, { skipRecompute: true });
     if (!state.store) {
@@ -971,11 +1429,24 @@ async function planStartupCatchup(
       skipJobIds: opts?.skipJobIds,
       skipAtIfAlreadyRan: true,
       allowCronMissedRunByLastRun: true,
-    });
-    if (missed.length === 0) {
+    }).filter((job) => shouldIncludeCatchupMissedJob(state, job, opts));
+    const candidatesById = new Map<string, CronJob>(missed.map((job) => [job.id, job]));
+
+    if (opts?.recoveryMode === "network-recovery") {
+      for (const job of collectExplicitNetworkRecoveryCandidates(state, opts)) {
+        candidatesById.set(job.id, job);
+      }
+    }
+
+    const dedupedCandidates = [...candidatesById.values()];
+    if (dedupedCandidates.length === 0) {
       return { candidates: [], deferredJobIds: [] };
     }
-    const sorted = missed.toSorted(
+    const maxImmediate =
+      opts?.recoveryMode === "network-recovery"
+        ? dedupedCandidates.length
+        : Math.max(0, state.deps.maxMissedJobsPerRestart ?? DEFAULT_MAX_MISSED_JOBS_PER_RESTART);
+    const sorted = dedupedCandidates.toSorted(
       (a, b) => (a.state.nextRunAtMs ?? 0) - (b.state.nextRunAtMs ?? 0),
     );
     const startupCandidates = sorted.slice(0, maxImmediate);
@@ -985,15 +1456,17 @@ async function planStartupCatchup(
         {
           immediateCount: startupCandidates.length,
           deferredCount: deferred.length,
-          totalMissed: missed.length,
+          totalMissed: dedupedCandidates.length,
         },
         "cron: staggering missed jobs to prevent gateway overload",
       );
     }
     if (startupCandidates.length > 0) {
+      const catchupReason =
+        opts?.recoveryMode === "network-recovery" ? "network recovery" : "restart";
       state.deps.log.info(
         { count: startupCandidates.length, jobIds: startupCandidates.map((j) => j.id) },
-        "cron: running missed jobs after restart",
+        `cron: running missed jobs after ${catchupReason}`,
       );
     }
     for (const job of startupCandidates) {
@@ -1006,6 +1479,45 @@ async function planStartupCatchup(
       candidates: startupCandidates.map((job) => ({ jobId: job.id, job })),
       deferredJobIds: deferred.map((job) => job.id),
     };
+  });
+}
+
+function shouldIncludeCatchupMissedJob(
+  state: CronServiceState,
+  job: CronJob,
+  opts?: CatchupOptions,
+): boolean {
+  if (opts?.criticalJobIds && !opts.criticalJobIds.has(job.id)) {
+    return false;
+  }
+  if (opts?.recoveryMode !== "network-recovery") {
+    return true;
+  }
+  return (
+    isNetworkRecoverableCronError(job.state.lastError) ||
+    (typeof state.networkRecovery.lastNetworkFailureAtMs === "number" &&
+      (job.state.lastRunAtMs ?? 0) <= state.networkRecovery.lastNetworkFailureAtMs)
+  );
+}
+
+function collectExplicitNetworkRecoveryCandidates(
+  state: CronServiceState,
+  opts?: CatchupOptions,
+): CronJob[] {
+  if (!state.store) {
+    return [];
+  }
+  return state.store.jobs.filter((job) => {
+    if (opts?.criticalJobIds && !opts.criticalJobIds.has(job.id)) {
+      return false;
+    }
+    if (opts?.skipJobIds?.has(job.id)) {
+      return false;
+    }
+    if (!isJobEnabled(job) || typeof job.state.runningAtMs === "number") {
+      return false;
+    }
+    return job.state.lastStatus === "error" && isNetworkRecoverableCronError(job.state.lastError);
   });
 }
 
@@ -1076,6 +1588,7 @@ async function applyStartupCatchupOutcomes(
 
     for (const result of outcomes) {
       applyOutcomeToStoredJob(state, result);
+      recordNetworkRecoverySignal(state, result);
     }
 
     if (plan.deferredJobIds.length > 0) {

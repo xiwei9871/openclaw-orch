@@ -213,9 +213,12 @@ describe("task orchestration gateway methods", () => {
       | undefined;
     const watsonTask = resultPayload?.createdTasks[0];
     expect(watsonTask).toBeDefined();
+    if (!watsonTask) {
+      throw new Error("expected watson handoff task to be created");
+    }
 
     const watsonResultRespond = await runGatewayMethod("tasks.result", {
-      taskId: watsonTask?.taskId ?? "",
+      taskId: watsonTask.taskId,
       agentId: "agent_watson",
       status: "done",
       resultSummary: "已完成方案初稿，交给 Jarvis 收口",
