@@ -1,7 +1,4 @@
 import type * as Lark from "@larksuiteoapi/node-sdk";
-import { resolveFeishuRuntimeAccount } from "../../extensions/feishu/src/accounts.js";
-import { createFeishuClient } from "../../extensions/feishu/src/client.js";
-import type { OpenClawConfig } from "../config/config.js";
 
 type LarkResponse<T = unknown> = { code?: number; msg?: string; data?: T };
 
@@ -321,29 +318,12 @@ function buildViewPatchData(params: {
   };
 }
 
-export function createFeishuBitableClient(params: {
-  cfg: OpenClawConfig;
-  accountId?: string;
-}): FeishuBitableClient {
-  const account = resolveFeishuRuntimeAccount({
-    cfg: params.cfg,
-    accountId: normalizeOptional(params.accountId),
-  });
-  return createFeishuClient(account);
-}
-
 export async function syncBitableProjectionToFeishu(params: {
-  cfg: OpenClawConfig;
   projection: FeishuBitableProjection;
   target: FeishuBitableSyncTarget;
-  client?: FeishuBitableClient;
+  client: FeishuBitableClient;
 }): Promise<FeishuBitableSyncResult> {
-  const client =
-    params.client ??
-    createFeishuBitableClient({
-      cfg: params.cfg,
-      accountId: params.target.accountId,
-    });
+  const client = params.client;
 
   const existingFields = await listAllFields(client, params.target);
   const fieldIdsByName = new Map<string, string>();

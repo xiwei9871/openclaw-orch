@@ -1,6 +1,6 @@
+import { createFeishuBitableClient } from "../../../extensions/feishu/api.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
-  createFeishuBitableClient,
   syncBitableProjectionToFeishu,
   type FeishuBitableClient,
   type FeishuBitableProjection,
@@ -71,7 +71,6 @@ export async function syncTaskControlProjectionToFeishu(params: {
 }): Promise<FeishuTaskControlSyncResult> {
   const uniqueFieldName = params.target.uniqueFieldName ?? DEFAULT_UNIQUE_FIELD_NAME;
   const result = await syncBitableProjectionToFeishu({
-    cfg: params.cfg,
     projection: toGenericProjection(params.projection),
     target: {
       appToken: params.target.appToken,
@@ -79,7 +78,12 @@ export async function syncTaskControlProjectionToFeishu(params: {
       accountId: params.target.accountId,
       rowKeyFieldName: uniqueFieldName,
     },
-    client: params.client,
+    client:
+      params.client ??
+      createFeishuBitableClient({
+        cfg: params.cfg,
+        accountId: params.target.accountId,
+      }),
   });
   const { rowKeyFieldName: _rowKeyFieldName, ...taskResult } = result;
   return {

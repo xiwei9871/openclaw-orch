@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { main } from "../../scripts/orchestration-dashboard-sync.js";
+import { main, type SchedulerSyncDeps } from "../../scripts/orchestration-dashboard-sync.js";
+import type { FeishuBitableClient } from "../../src/tasks/feishu-bitable-sync.js";
 
 const cronOutput = JSON.stringify([{ id: "cron-42", name: "Nightly" }]);
 
-function createDeps(overrides: Record<string, unknown> = {}) {
+function createDeps(overrides: Partial<SchedulerSyncDeps> = {}): SchedulerSyncDeps {
   return {
     readCronOutput: vi.fn(() => cronOutput),
     loadConfig: vi.fn(() => ({})),
+    createClient: vi.fn(() => ({}) as FeishuBitableClient),
     syncProjection: vi.fn(async () => ({ accountId: "default" })),
     writeOutput: vi.fn(),
     log: vi.fn(),

@@ -648,7 +648,7 @@ export async function tasksControlCommand(
       runtime.exit(1);
       return;
     }
-    const { sendMessageFeishu } = await import("../../extensions/feishu/src/send.js");
+    const { sendMessageFeishu } = await import("../../extensions/feishu/api.js");
     const cfg = loadConfig();
     const accountId = opts.summaryAccount?.trim() || opts.feishuAccount?.trim() || "jarvis";
     await sendMessageFeishu({

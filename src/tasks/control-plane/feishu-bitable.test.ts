@@ -269,7 +269,6 @@ describe("task control plane feishu bitable sync", () => {
     });
 
     const result = await syncBitableProjectionToFeishu({
-      cfg: {} as OpenClawConfig,
       projection: {
         fields: [
           { key: "对象ID", fieldType: 1 },

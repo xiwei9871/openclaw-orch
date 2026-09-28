@@ -16,7 +16,7 @@ import { tasksAuditCommand, tasksControlCommand, tasksMaintenanceCommand } from 
 
 const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
 
-vi.mock("../../extensions/feishu/src/send.js", () => ({
+vi.mock("../../extensions/feishu/api.js", () => ({
   sendMessageFeishu: sendMessageFeishuMock,
 }));
 

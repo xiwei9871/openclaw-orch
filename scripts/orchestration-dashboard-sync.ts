@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createFeishuBitableClient } from "../extensions/feishu/api.js";
 import { loadConfig } from "../src/config/config.js";
 import type { OpenClawConfig } from "../src/config/config.js";
 import {
@@ -27,10 +28,14 @@ export type SchedulerSyncDeps = {
   readCronOutput?: (openclawBin: string) => string;
   loadConfig?: () => OpenClawConfig;
   syncProjection?: (params: {
-    cfg: OpenClawConfig;
     projection: ReturnType<typeof buildSchedulerProjection>;
     target: FeishuBitableSyncTarget;
+    client: import("../src/tasks/feishu-bitable-sync.js").FeishuBitableClient;
   }) => Promise<Pick<FeishuBitableSyncResult, "accountId">>;
+  createClient?: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string;
+  }) => import("../src/tasks/feishu-bitable-sync.js").FeishuBitableClient;
   writeOutput?: (payload: string, resultPath?: string) => void;
   now?: () => number;
   log?: (message: string) => void;
@@ -106,8 +111,11 @@ export async function main(
       throw new Error("app token and table id are required for a live sync");
     }
     const cfg = (deps.loadConfig ?? loadConfig)();
-    const result = await (deps.syncProjection ?? syncBitableProjectionToFeishu)({
+    const client = (deps.createClient ?? createFeishuBitableClient)({
       cfg,
+      accountId: options.accountId?.trim() || undefined,
+    });
+    const result = await (deps.syncProjection ?? syncBitableProjectionToFeishu)({
       projection,
       target: {
         appToken,
@@ -115,6 +123,7 @@ export async function main(
         accountId: options.accountId?.trim() || undefined,
         rowKeyFieldName: "对象ID",
       },
+      client,
     });
     const output = JSON.stringify({
       ok: true,
