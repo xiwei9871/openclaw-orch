@@ -48,7 +48,18 @@ pnpm exec vitest run src/commands/tasks.test.ts
 pnpm exec vitest run src/cli/program/register.status-health-sessions.test.ts
 ```
 
-4. Re-run live projection validation:
+4. Validate the scheduler dashboard projection offline:
+
+```bash
+pnpm orchestration:sync-cron-dashboard -- --dry-run
+```
+
+The scheduler projection reads `openclaw cron list --all --json` and keeps each
+cron job's stable `job.id` in the `对象ID` field. A live sync requires
+`--app-token` and `--table-id` (or the matching `ORCH_DASHBOARD_SYNC_*`
+environment variables). Do not use the live form during code verification.
+
+5. Re-run live projection validation:
 
 ```bash
 node --import tsx src/index.ts tasks control --json
@@ -59,7 +70,7 @@ node --import tsx src/index.ts tasks control \
   --table-id <table_id>
 ```
 
-5. Re-run live summary validation:
+6. Re-run live summary validation:
 
 ```bash
 node --import tsx src/index.ts tasks control \

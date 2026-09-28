@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { syncBitableProjectionToFeishu } from "../feishu-bitable-sync.js";
 import type { TaskRecord } from "../task-registry.types.js";
 import {
   syncTaskControlProjectionToFeishu,
@@ -259,6 +260,40 @@ function createFakeFeishuTaskControlClient(): FeishuTaskControlClient & {
 }
 
 describe("task control plane feishu bitable sync", () => {
+  it("upserts generic projections by their configured row key", async () => {
+    const client = createFakeFeishuTaskControlClient();
+    client.state.fields.push({ field_id: "fld_key", field_name: "对象ID", type: 1 });
+    client.state.records.push({
+      record_id: "rec_existing",
+      fields: { 对象ID: "cron-42", Name: "Old name" },
+    });
+
+    const result = await syncBitableProjectionToFeishu({
+      cfg: {} as OpenClawConfig,
+      projection: {
+        fields: [
+          { key: "对象ID", fieldType: 1 },
+          { key: "Name", fieldType: 1 },
+        ],
+        rows: [{ rowKey: "cron-42", fields: { Name: "Nightly job" } }],
+        views: [],
+      },
+      target: {
+        appToken: "app_token_1",
+        tableId: "tbl_1",
+        rowKeyFieldName: "对象ID",
+      },
+      client,
+    });
+
+    expect(result.rowsCreated).toBe(0);
+    expect(result.rowsUpdated).toBe(1);
+    expect(client.state.records[0]?.fields).toMatchObject({
+      对象ID: "cron-42",
+      Name: "Nightly job",
+    });
+  });
+
   it("creates missing fields, upserts rows, and materializes views", async () => {
     const now = Date.UTC(2026, 3, 10, 6, 0, 0);
     const { projection } = createModel(now);
