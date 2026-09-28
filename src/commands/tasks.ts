@@ -648,10 +648,11 @@ export async function tasksControlCommand(
       runtime.exit(1);
       return;
     }
-    const { sendMessageFeishu } = await import("../../extensions/feishu/api.js");
+    const { sendTaskControlFeishuSummary } =
+      await import("../tasks/control-plane/feishu-summary.js");
     const cfg = loadConfig();
     const accountId = opts.summaryAccount?.trim() || opts.feishuAccount?.trim() || "jarvis";
-    await sendMessageFeishu({
+    await sendTaskControlFeishuSummary({
       cfg,
       to: opts.summaryTarget.trim(),
       text: projectionLayer.summary.text,

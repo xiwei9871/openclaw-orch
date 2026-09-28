@@ -14,10 +14,10 @@ import {
 import { withTempDir } from "../test-helpers/temp-dir.js";
 import { tasksAuditCommand, tasksControlCommand, tasksMaintenanceCommand } from "./tasks.js";
 
-const sendMessageFeishuMock = vi.hoisted(() => vi.fn());
+const sendTaskControlFeishuSummaryMock = vi.hoisted(() => vi.fn());
 
-vi.mock("../../extensions/feishu/api.js", () => ({
-  sendMessageFeishu: sendMessageFeishuMock,
+vi.mock("../tasks/control-plane/feishu-summary.js", () => ({
+  sendTaskControlFeishuSummary: sendTaskControlFeishuSummaryMock,
 }));
 
 const ORIGINAL_STATE_DIR = process.env.OPENCLAW_STATE_DIR;
@@ -263,7 +263,7 @@ describe("tasks commands", () => {
       await withTempDir({ prefix: "openclaw-task-summary-" }, async (root) => {
         const summaryPath = path.join(root, "task_health.md");
         const runtime = createRuntime();
-        sendMessageFeishuMock.mockResolvedValue({
+        sendTaskControlFeishuSummaryMock.mockResolvedValue({
           messageId: "om_summary",
           chatId: "oc_group_1",
         });
@@ -282,7 +282,7 @@ describe("tasks commands", () => {
         expect(written).toContain("# Task Control 每日健康报告");
         expect(written).toContain("生成时间：");
         expect(written).toContain("总体：");
-        expect(sendMessageFeishuMock).toHaveBeenCalledWith(
+        expect(sendTaskControlFeishuSummaryMock).toHaveBeenCalledWith(
           expect.objectContaining({
             accountId: "jarvis",
             to: "chat:oc_group_1",
