@@ -103,4 +103,107 @@ describe("orchestration dashboard sync runner", () => {
       }),
     );
   });
+
+  it("passes the secret-resolved config to the client factory", async () => {
+    const resolvedCfg = { marker: "resolved" };
+    const resolveSecrets = vi.fn(async () => resolvedCfg as never);
+    const createClient = vi.fn(() => ({}) as FeishuBitableClient);
+    const deps = createDeps({ resolveSecrets, createClient });
+
+    const exitCode = await main(
+      ["--app-token", "app", "--table-id", "table", "--account", "jarvis"],
+      deps,
+    );
+
+    expect(exitCode).toBe(0);
+    expect(resolveSecrets).toHaveBeenCalledWith(expect.objectContaining({ accountId: "jarvis" }));
+    expect(createClient).toHaveBeenCalledWith(
+      expect.objectContaining({ cfg: resolvedCfg, accountId: "jarvis" }),
+    );
+  });
+
+  it("resolves the selected account's file SecretRef in memory only", async () => {
+    const { withTempDir } = await import("../test-helpers/temp-dir.js");
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    await withTempDir({ prefix: "orch-secrets-" }, async (root) => {
+      const secretsFile = path.join(root, "secrets.json");
+      await fs.writeFile(secretsFile, JSON.stringify({ appSecret: "resolved-app-secret" }), {
+        mode: 0o600,
+      });
+      await fs.chmod(secretsFile, 0o600);
+      const cfg = {
+        channels: {
+          feishu: {
+            defaultAccount: "jarvis",
+            accounts: {
+              jarvis: {
+                appId: "cli_test",
+                appSecret: { source: "file", provider: "testfile", id: "/appSecret" },
+              },
+            },
+          },
+        },
+        secrets: {
+          providers: { testfile: { source: "file", path: secretsFile, mode: "json" } },
+        },
+      };
+      const createClient = vi.fn((_params: { cfg: unknown; accountId?: string }) => {
+        return {} as FeishuBitableClient;
+      });
+      const deps = createDeps({
+        loadConfig: vi.fn(() => cfg as never),
+        createClient,
+      });
+
+      const exitCode = await main(["--app-token", "app", "--table-id", "table"], deps);
+
+      expect(exitCode).toBe(0);
+      const seenCfg = createClient.mock.calls[0]?.[0]?.cfg as {
+        channels: { feishu: { accounts: { jarvis: { appSecret: string } } } };
+      };
+      expect(seenCfg.channels.feishu.accounts.jarvis.appSecret).toBe("resolved-app-secret");
+      const logSpy = deps.log as ReturnType<typeof vi.fn>;
+      for (const call of logSpy.mock.calls) {
+        expect(JSON.stringify(call)).not.toContain("resolved-app-secret");
+      }
+    });
+  });
+
+  it("fails closed when the selected account's SecretRef cannot be resolved", async () => {
+    const { withTempDir } = await import("../test-helpers/temp-dir.js");
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    await withTempDir({ prefix: "orch-secrets-" }, async (root) => {
+      const secretsFile = path.join(root, "secrets.json");
+      await fs.writeFile(secretsFile, JSON.stringify({ other: "value" }), { mode: 0o600 });
+      await fs.chmod(secretsFile, 0o600);
+      const cfg = {
+        channels: {
+          feishu: {
+            accounts: {
+              jarvis: {
+                appId: "cli_test",
+                appSecret: { source: "file", provider: "testfile", id: "/missing" },
+              },
+            },
+          },
+        },
+        secrets: {
+          providers: { testfile: { source: "file", path: secretsFile, mode: "json" } },
+        },
+      };
+      const deps = createDeps({ loadConfig: vi.fn(() => cfg as never) });
+
+      const exitCode = await main(
+        ["--app-token", "app", "--table-id", "table", "--account", "jarvis"],
+        deps,
+      );
+
+      expect(exitCode).toBe(1);
+      expect(deps.error).toHaveBeenCalledWith(expect.stringMatching(/appSecret/));
+      expect(deps.createClient).not.toHaveBeenCalled();
+      expect(deps.syncProjection).not.toHaveBeenCalled();
+    });
+  });
 });

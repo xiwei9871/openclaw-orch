@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createFeishuBitableClient } from "../extensions/feishu/api.js";
-import { loadConfig } from "../src/config/config.js";
+import { readBestEffortConfig } from "../src/config/config.js";
 import type { OpenClawConfig } from "../src/config/config.js";
+import { resolveConfiguredSecretInputString } from "../src/gateway/resolve-configured-secret-input-string.js";
 import {
   syncBitableProjectionToFeishu,
   type FeishuBitableSyncResult,
@@ -26,7 +27,12 @@ type RunnerOptions = {
 
 export type SchedulerSyncDeps = {
   readCronOutput?: (openclawBin: string) => string;
-  loadConfig?: () => OpenClawConfig;
+  loadConfig?: () => OpenClawConfig | Promise<OpenClawConfig>;
+  resolveSecrets?: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string;
+    env: NodeJS.ProcessEnv;
+  }) => Promise<OpenClawConfig>;
   syncProjection?: (params: {
     projection: ReturnType<typeof buildSchedulerProjection>;
     target: FeishuBitableSyncTarget;
@@ -82,6 +88,75 @@ function defaultWriteOutput(payload: string, resultPath?: string): void {
   fs.writeFileSync(outputPath, `${payload}\n`, "utf8");
 }
 
+async function defaultLoadConfig(): Promise<OpenClawConfig> {
+  // The live openclaw.json is written by the running gateway and may carry
+  // keys newer than this repo's schema (strict loadConfig() would throw
+  // INVALID_CONFIG). The scheduler sync only needs channels.feishu plus the
+  // secrets provider definitions, so a best-effort read is sufficient.
+  return await readBestEffortConfig();
+}
+
+type FeishuChannelConfig = {
+  defaultAccount?: string;
+  appId?: unknown;
+  appSecret?: unknown;
+  accounts?: Record<string, { appId?: unknown; appSecret?: unknown } | undefined>;
+};
+
+function selectFeishuAccountId(feishu: FeishuChannelConfig, requested?: string): string {
+  if (requested?.trim()) {
+    return requested.trim();
+  }
+  const preferred = feishu.defaultAccount?.trim();
+  if (preferred) {
+    return preferred;
+  }
+  const ids = Object.keys(feishu.accounts ?? {});
+  return (ids.includes("default") ? "default" : ids[0]) ?? "default";
+}
+
+export async function resolveSchedulerConfigSecrets(params: {
+  cfg: OpenClawConfig;
+  accountId?: string;
+  env: NodeJS.ProcessEnv;
+}): Promise<OpenClawConfig> {
+  // Resolve the selected Feishu account's SecretRef credentials in memory.
+  // Secrets never touch disk, logs, or the result payload.
+  const resolved = structuredClone(params.cfg);
+  const feishu = (resolved.channels as { feishu?: FeishuChannelConfig } | undefined)?.feishu;
+  if (!feishu) {
+    return resolved;
+  }
+  const accountId = selectFeishuAccountId(feishu, params.accountId);
+  const scopes: Array<[{ appId?: unknown; appSecret?: unknown }, string]> = [
+    [feishu, "channels.feishu"],
+  ];
+  const account = feishu.accounts?.[accountId];
+  if (account) {
+    scopes.push([account, `channels.feishu.accounts.${accountId}`]);
+  }
+  for (const [scope, base] of scopes) {
+    for (const key of ["appId", "appSecret"] as const) {
+      const current = scope[key];
+      if (current === undefined) {
+        continue;
+      }
+      const path = `${base}.${key}`;
+      const { value, unresolvedRefReason } = await resolveConfiguredSecretInputString({
+        config: params.cfg,
+        env: params.env,
+        value: current,
+        path,
+      });
+      if (unresolvedRefReason || value === undefined) {
+        throw new Error(unresolvedRefReason ?? `${path} SecretRef resolved to no value.`);
+      }
+      scope[key] = value;
+    }
+  }
+  return resolved;
+}
+
 export async function main(
   argv = process.argv.slice(2),
   deps: SchedulerSyncDeps = {},
@@ -110,9 +185,14 @@ export async function main(
     if (!appToken || !tableId) {
       throw new Error("app token and table id are required for a live sync");
     }
-    const cfg = (deps.loadConfig ?? loadConfig)();
-    const client = (deps.createClient ?? createFeishuBitableClient)({
+    const cfg = await (deps.loadConfig ?? defaultLoadConfig)();
+    const resolvedCfg = await (deps.resolveSecrets ?? resolveSchedulerConfigSecrets)({
       cfg,
+      accountId: options.accountId?.trim() || undefined,
+      env,
+    });
+    const client = (deps.createClient ?? createFeishuBitableClient)({
+      cfg: resolvedCfg,
       accountId: options.accountId?.trim() || undefined,
     });
     const result = await (deps.syncProjection ?? syncBitableProjectionToFeishu)({
