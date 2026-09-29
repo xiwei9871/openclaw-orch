@@ -318,12 +318,71 @@ function buildViewPatchData(params: {
   };
 }
 
+function rowKeyFromFieldValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : typeof value === "number" ? String(value) : "";
+}
+
+function collectDuplicateRowKeys(rowKeys: string[]): Array<{ rowKey: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const rowKey of rowKeys) {
+    if (rowKey) {
+      counts.set(rowKey, (counts.get(rowKey) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([rowKey, count]) => ({ rowKey, count }));
+}
+
+function assertNoDuplicateRowKeys(params: {
+  scope: string;
+  rowKeyFieldName: string;
+  rowKeys: string[];
+}): void {
+  const duplicates = collectDuplicateRowKeys(params.rowKeys);
+  if (duplicates.length === 0) {
+    return;
+  }
+  const detail = duplicates
+    .slice(0, 10)
+    .map((dup) => `${JSON.stringify(dup.rowKey)} x${dup.count}`)
+    .join(", ");
+  throw new Error(
+    `Refusing Feishu sync: duplicate row keys for rowKeyFieldName ` +
+      `${JSON.stringify(params.rowKeyFieldName)} in ${params.scope}: ${detail}` +
+      `${duplicates.length > 10 ? `, ... +${duplicates.length - 10} more` : ""}. ` +
+      `Resolve duplicates before syncing.`,
+  );
+}
+
 export async function syncBitableProjectionToFeishu(params: {
   projection: FeishuBitableProjection;
   target: FeishuBitableSyncTarget;
   client: FeishuBitableClient;
 }): Promise<FeishuBitableSyncResult> {
   const client = params.client;
+
+  // Fail closed before any write: never guess which duplicate row is canonical.
+  assertNoDuplicateRowKeys({
+    scope: "projection rows",
+    rowKeyFieldName: params.target.rowKeyFieldName,
+    rowKeys: params.projection.rows.map((row) => row.rowKey),
+  });
+  const existingRecords = await listAllRecords(client, params.target);
+  const recordIdByRowKey = new Map<string, string>();
+  const existingRowKeys: string[] = [];
+  for (const record of existingRecords) {
+    const rowKey = rowKeyFromFieldValue(record.fields?.[params.target.rowKeyFieldName]);
+    if (rowKey && record.record_id?.trim()) {
+      existingRowKeys.push(rowKey);
+      recordIdByRowKey.set(rowKey, record.record_id);
+    }
+  }
+  assertNoDuplicateRowKeys({
+    scope: `existing records in table ${params.target.tableId}`,
+    rowKeyFieldName: params.target.rowKeyFieldName,
+    rowKeys: existingRowKeys,
+  });
 
   const existingFields = await listAllFields(client, params.target);
   const fieldIdsByName = new Map<string, string>();
@@ -374,17 +433,6 @@ export async function syncBitableProjectionToFeishu(params: {
     fieldIdsByName.clear();
     fieldsByName.clear();
     indexFields(await listAllFields(client, params.target));
-  }
-
-  const existingRecords = await listAllRecords(client, params.target);
-  const recordIdByRowKey = new Map<string, string>();
-  for (const record of existingRecords) {
-    const value = record.fields?.[params.target.rowKeyFieldName];
-    const rowKey =
-      typeof value === "string" ? value.trim() : typeof value === "number" ? String(value) : "";
-    if (rowKey && record.record_id?.trim()) {
-      recordIdByRowKey.set(rowKey, record.record_id);
-    }
   }
 
   const createPayloads: Array<{ fields: Record<string, string | number> }> = [];
