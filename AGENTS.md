@@ -319,3 +319,7 @@
 - For manual `openclaw message send` messages that include `!`, use the heredoc pattern noted below to avoid the Bash tool’s escaping.
 - Release guardrails: do not change version numbers without operator’s explicit consent; always ask permission before running any npm publish/release step.
 - Beta release guardrail: when using a beta Git tag (for example `vYYYY.M.D-beta.N`), publish npm with a matching beta version suffix (for example `YYYY.M.D-beta.N`) rather than a plain version on `--tag beta`; otherwise the plain version name gets consumed/blocked.
+
+## Project Continuity (Devin V1.0.1)
+- Session start: read `docs/agent_governance/{PROJECT_STATE.yaml,DECISIONS.md,HANDOFF.md}` — repo files override chat memory.
+- `python3 tools/gov/openclaworch_gates.py all` before status claims; unverified ⇒ NOT_VERIFIED.
